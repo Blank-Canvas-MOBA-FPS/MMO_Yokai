@@ -18,8 +18,21 @@ namespace Mirror
     }
 
     /// <summary>NetworkClient with connection to server.</summary>
-    public static class NetworkClient
+    public static partial class NetworkClient
     {
+        // time & value snapshot interpolation are separate.
+        // -> time is interpolated globally on NetworkClient / NetworkConnection
+        // -> value is interpolated per-component, i.e. NetworkTransform.
+        // however, both need to be on the same send interval.
+        //
+        // additionally, server & client need to use the same send interval.
+        // otherwise it's too easy to accidentally cause interpolation issues if
+        // a component sends with client.interval but interpolates with
+        // server.interval, etc.
+        public static int sendRate => NetworkServer.sendRate;
+        public static float sendInterval => sendRate < int.MaxValue ? 1f / sendRate : 0; // for 30 Hz, that's 33ms
+        static double lastSendTime;
+
         // message handlers by messageId
         internal static readonly Dictionary<ushort, NetworkMessageDelegate> handlers =
             new Dictionary<ushort, NetworkMessageDelegate>();
@@ -69,21 +82,21 @@ namespace Mirror
         // Connected/Disconnected messages over the network causing undefined
         // behaviour.
         // => public so that custom NetworkManagers can hook into it
-        public static Action OnConnectedEvent;
-        public static Action OnDisconnectedEvent;
-        public static Action<Exception> OnErrorEvent;
+        public static Action                         OnConnectedEvent;
+        public static Action                         OnDisconnectedEvent;
+        public static Action<TransportError, string> OnErrorEvent;
 
         /// <summary>Registered spawnable prefabs by assetId.</summary>
-        public static readonly Dictionary<Guid, GameObject> prefabs =
-            new Dictionary<Guid, GameObject>();
+        public static readonly Dictionary<uint, GameObject> prefabs =
+            new Dictionary<uint, GameObject>();
 
-        // custom spawn / unspawn handlers.
+        // custom spawn / unspawn handlers by assetId.
         // useful to support prefab pooling etc.:
         // https://mirror-networking.gitbook.io/docs/guides/gameobjects/custom-spawnfunctions
-        internal static readonly Dictionary<Guid, SpawnHandlerDelegate> spawnHandlers =
-            new Dictionary<Guid, SpawnHandlerDelegate>();
-        internal static readonly Dictionary<Guid, UnSpawnDelegate> unspawnHandlers =
-            new Dictionary<Guid, UnSpawnDelegate>();
+        internal static readonly Dictionary<uint, SpawnHandlerDelegate> spawnHandlers =
+            new Dictionary<uint, SpawnHandlerDelegate>();
+        internal static readonly Dictionary<uint, UnSpawnDelegate> unspawnHandlers =
+            new Dictionary<uint, UnSpawnDelegate>();
 
         // spawning
         // internal for tests
@@ -106,19 +119,19 @@ namespace Mirror
         static void AddTransportHandlers()
         {
             // += so that other systems can also hook into it (i.e. statistics)
-            Transport.activeTransport.OnClientConnected += OnTransportConnected;
-            Transport.activeTransport.OnClientDataReceived += OnTransportData;
-            Transport.activeTransport.OnClientDisconnected += OnTransportDisconnected;
-            Transport.activeTransport.OnClientError += OnError;
+            Transport.active.OnClientConnected    += OnTransportConnected;
+            Transport.active.OnClientDataReceived += OnTransportData;
+            Transport.active.OnClientDisconnected += OnTransportDisconnected;
+            Transport.active.OnClientError        += OnTransportError;
         }
 
         static void RemoveTransportHandlers()
         {
             // -= so that other systems can also hook into it (i.e. statistics)
-            Transport.activeTransport.OnClientConnected -= OnTransportConnected;
-            Transport.activeTransport.OnClientDataReceived -= OnTransportData;
-            Transport.activeTransport.OnClientDisconnected -= OnTransportDisconnected;
-            Transport.activeTransport.OnClientError -= OnError;
+            Transport.active.OnClientConnected    -= OnTransportConnected;
+            Transport.active.OnClientDataReceived -= OnTransportData;
+            Transport.active.OnClientDisconnected -= OnTransportDisconnected;
+            Transport.active.OnClientError        -= OnTransportError;
         }
 
         internal static void RegisterSystemHandlers(bool hostMode)
@@ -151,40 +164,45 @@ namespace Mirror
             }
 
             // These handlers are the same for host and remote clients
+            RegisterHandler<TimeSnapshotMessage>(OnTimeSnapshotMessage);
             RegisterHandler<ChangeOwnerMessage>(OnChangeOwner);
             RegisterHandler<RpcMessage>(OnRPCMessage);
         }
 
         // connect /////////////////////////////////////////////////////////////
+        // initialize is called before every connect
+        static void Initialize(bool hostMode)
+        {
+            // Debug.Log($"Client Connect: {address}");
+            Debug.Assert(Transport.active != null, "There was no active transport when calling NetworkClient.Connect, If you are calling Connect manually then make sure to set 'Transport.active' first");
+
+            // reset time interpolation on every new connect.
+            // ensures last sessions' state is cleared before starting again.
+            InitTimeInterpolation();
+
+            RegisterSystemHandlers(hostMode);
+            Transport.active.enabled = true;
+        }
+
         /// <summary>Connect client to a NetworkServer by address.</summary>
         public static void Connect(string address)
         {
-            // Debug.Log($"Client Connect: {address}");
-            Debug.Assert(Transport.activeTransport != null, "There was no active transport when calling NetworkClient.Connect, If you are calling Connect manually then make sure to set 'Transport.activeTransport' first");
+            Initialize(false);
 
-            RegisterSystemHandlers(false);
-            Transport.activeTransport.enabled = true;
             AddTransportHandlers();
-
             connectState = ConnectState.Connecting;
-            Transport.activeTransport.ClientConnect(address);
-
+            Transport.active.ClientConnect(address);
             connection = new NetworkConnectionToServer();
         }
 
         /// <summary>Connect client to a NetworkServer by Uri.</summary>
         public static void Connect(Uri uri)
         {
-            // Debug.Log($"Client Connect: {uri}");
-            Debug.Assert(Transport.activeTransport != null, "There was no active transport when calling NetworkClient.Connect, If you are calling Connect manually then make sure to set 'Transport.activeTransport' first");
+            Initialize(false);
 
-            RegisterSystemHandlers(false);
-            Transport.activeTransport.enabled = true;
             AddTransportHandlers();
-
             connectState = ConnectState.Connecting;
-            Transport.activeTransport.ClientConnect(uri);
-
+            Transport.active.ClientConnect(uri);
             connection = new NetworkConnectionToServer();
         }
 
@@ -192,9 +210,7 @@ namespace Mirror
         // called from NetworkManager.FinishStartHost()
         public static void ConnectHost()
         {
-            //Debug.Log("Client Connect Host to Server");
-
-            RegisterSystemHandlers(true);
+            Initialize(true);
 
             connectState = ConnectState.Connected;
 
@@ -280,7 +296,7 @@ namespace Mirror
         // helper function
         static bool UnpackAndInvoke(NetworkReader reader, int channelId)
         {
-            if (MessagePacking.Unpack(reader, out ushort msgType))
+            if (NetworkMessages.UnpackId(reader, out ushort msgType))
             {
                 // try to invoke the handler for that message
                 if (handlers.TryGetValue(msgType, out NetworkMessageDelegate handler))
@@ -347,7 +363,7 @@ namespace Mirror
                        unbatcher.GetNextMessage(out NetworkReader reader, out double remoteTimestamp))
                 {
                     // enough to read at least header size?
-                    if (reader.Remaining >= MessagePacking.HeaderSize)
+                    if (reader.Remaining >= NetworkMessages.IdSize)
                     {
                         // make remoteTimeStamp available to the user
                         connection.remoteTimeStamp = remoteTimestamp;
@@ -421,6 +437,8 @@ namespace Mirror
 
             connectState = ConnectState.Disconnected;
             ready = false;
+            snapshots.Clear();
+            localTimeline = 0;
 
             // now that everything was handled, clear the connection.
             // previously this was done in Disconnect() already, but we still
@@ -432,10 +450,13 @@ namespace Mirror
             RemoveTransportHandlers();
         }
 
-        static void OnError(Exception exception)
+        // transport errors are forwarded to high level
+        static void OnTransportError(TransportError error, string reason)
         {
-            Debug.LogException(exception);
-            OnErrorEvent?.Invoke(exception);
+            // transport errors will happen. logging a warning is enough.
+            // make sure the user does not panic.
+            Debug.LogWarning($"Client Transport Error: {error}: {reason}. This is fine.");
+            OnErrorEvent?.Invoke(error, reason);
         }
 
         // send ////////////////////////////////////////////////////////////////
@@ -459,16 +480,17 @@ namespace Mirror
         public static void RegisterHandler<T>(Action<T> handler, bool requireAuthentication = true)
             where T : struct, NetworkMessage
         {
-            ushort msgType = MessagePacking.GetId<T>();
+            ushort msgType = NetworkMessages.GetId<T>();
             if (handlers.ContainsKey(msgType))
             {
                 Debug.LogWarning($"NetworkClient.RegisterHandler replacing handler for {typeof(T).FullName}, id={msgType}. If replacement is intentional, use ReplaceHandler instead to avoid this warning.");
             }
+
             // we use the same WrapHandler function for server and client.
             // so let's wrap it to ignore the NetworkConnection parameter.
             // it's not needed on client. it's always NetworkClient.connection.
             void HandlerWrapped(NetworkConnection _, T value) => handler(value);
-            handlers[msgType] = MessagePacking.WrapHandler((Action<NetworkConnection, T>) HandlerWrapped, requireAuthentication);
+            handlers[msgType] = NetworkMessages.WrapHandler((Action<NetworkConnection, T>)HandlerWrapped, requireAuthentication);
         }
 
         /// <summary>Replace a handler for a particular message type. Should require authentication by default.</summary>
@@ -477,8 +499,8 @@ namespace Mirror
         public static void ReplaceHandler<T>(Action<NetworkConnection, T> handler, bool requireAuthentication = true)
             where T : struct, NetworkMessage
         {
-            ushort msgType = MessagePacking.GetId<T>();
-            handlers[msgType] = MessagePacking.WrapHandler(handler, requireAuthentication);
+            ushort msgType = NetworkMessages.GetId<T>();
+            handlers[msgType] = NetworkMessages.WrapHandler(handler, requireAuthentication);
         }
 
         /// <summary>Replace a handler for a particular message type. Should require authentication by default.</summary>
@@ -495,24 +517,25 @@ namespace Mirror
             where T : struct, NetworkMessage
         {
             // use int to minimize collisions
-            ushort msgType = MessagePacking.GetId<T>();
+            ushort msgType = NetworkMessages.GetId<T>();
             return handlers.Remove(msgType);
         }
 
         // spawnable prefabs ///////////////////////////////////////////////////
         /// <summary>Find the registered prefab for this asset id.</summary>
         // Useful for debuggers
-        public static bool GetPrefab(Guid assetId, out GameObject prefab)
+        public static bool GetPrefab(uint assetId, out GameObject prefab)
         {
             prefab = null;
-            return assetId != Guid.Empty &&
-                   prefabs.TryGetValue(assetId, out prefab) && prefab != null;
+            return assetId != 0 &&
+                   prefabs.TryGetValue(assetId, out prefab) &&
+                   prefab != null;
         }
 
         /// <summary>Validates Prefab then adds it to prefabs dictionary.</summary>
         static void RegisterPrefabIdentity(NetworkIdentity prefab)
         {
-            if (prefab.assetId == Guid.Empty)
+            if (prefab.assetId == 0)
             {
                 Debug.LogError($"Can not Register '{prefab.name}' because it had empty assetid. If this is a scene Object use RegisterSpawnHandler instead");
                 return;
@@ -550,7 +573,7 @@ namespace Mirror
         // Note: newAssetId can not be set on GameObjects that already have an assetId
         // Note: registering with assetId is useful for assetbundles etc. a lot
         //       of people use this.
-        public static void RegisterPrefab(GameObject prefab, Guid newAssetId)
+        public static void RegisterPrefab(GameObject prefab, uint newAssetId)
         {
             if (prefab == null)
             {
@@ -558,7 +581,7 @@ namespace Mirror
                 return;
             }
 
-            if (newAssetId == Guid.Empty)
+            if (newAssetId == 0)
             {
                 Debug.LogError($"Could not register '{prefab.name}' with new assetId because the new assetId was empty");
                 return;
@@ -571,7 +594,7 @@ namespace Mirror
                 return;
             }
 
-            if (identity.assetId != Guid.Empty && identity.assetId != newAssetId)
+            if (identity.assetId != 0 && identity.assetId != newAssetId)
             {
                 Debug.LogError($"Could not register '{prefab.name}' to {newAssetId} because it already had an AssetId, Existing assetId {identity.assetId}");
                 return;
@@ -606,7 +629,7 @@ namespace Mirror
         // Note: registering with assetId is useful for assetbundles etc. a lot
         //       of people use this.
         // TODO why do we have one with SpawnDelegate and one with SpawnHandlerDelegate?
-        public static void RegisterPrefab(GameObject prefab, Guid newAssetId, SpawnDelegate spawnHandler, UnSpawnDelegate unspawnHandler)
+        public static void RegisterPrefab(GameObject prefab, uint newAssetId, SpawnDelegate spawnHandler, UnSpawnDelegate unspawnHandler)
         {
             // We need this check here because we don't want a null handler in the lambda expression below
             if (spawnHandler == null)
@@ -641,9 +664,7 @@ namespace Mirror
                 return;
             }
 
-            Guid assetId = identity.assetId;
-
-            if (assetId == Guid.Empty)
+            if (identity.assetId == 0)
             {
                 Debug.LogError($"Can not Register handler for '{prefab.name}' because it had empty assetid. If this is a scene Object use RegisterSpawnHandler instead");
                 return;
@@ -652,7 +673,7 @@ namespace Mirror
             // We need this check here because we don't want a null handler in the lambda expression below
             if (spawnHandler == null)
             {
-                Debug.LogError($"Can not Register null SpawnHandler for {assetId}");
+                Debug.LogError($"Can not Register null SpawnHandler for {identity.assetId}");
                 return;
             }
 
@@ -664,9 +685,9 @@ namespace Mirror
         // Note: registering with assetId is useful for assetbundles etc. a lot
         //       of people use this.
         // TODO why do we have one with SpawnDelegate and one with SpawnHandlerDelegate?
-        public static void RegisterPrefab(GameObject prefab, Guid newAssetId, SpawnHandlerDelegate spawnHandler, UnSpawnDelegate unspawnHandler)
+        public static void RegisterPrefab(GameObject prefab, uint newAssetId, SpawnHandlerDelegate spawnHandler, UnSpawnDelegate unspawnHandler)
         {
-            if (newAssetId == Guid.Empty)
+            if (newAssetId == 0)
             {
                 Debug.LogError($"Could not register handler for '{prefab.name}' with new assetId because the new assetId was empty");
                 return;
@@ -685,7 +706,7 @@ namespace Mirror
                 return;
             }
 
-            if (identity.assetId != Guid.Empty && identity.assetId != newAssetId)
+            if (identity.assetId != 0 && identity.assetId != newAssetId)
             {
                 Debug.LogError($"Could not register Handler for '{prefab.name}' to {newAssetId} because it already had an AssetId, Existing assetId {identity.assetId}");
                 return;
@@ -698,7 +719,7 @@ namespace Mirror
             }
 
             identity.assetId = newAssetId;
-            Guid assetId = identity.assetId;
+            uint assetId = identity.assetId;
 
             if (spawnHandler == null)
             {
@@ -758,9 +779,9 @@ namespace Mirror
                 return;
             }
 
-            Guid assetId = identity.assetId;
+            uint assetId = identity.assetId;
 
-            if (assetId == Guid.Empty)
+            if (assetId == 0)
             {
                 Debug.LogError($"Can not Register handler for '{prefab.name}' because it had empty assetid. If this is a scene Object use RegisterSpawnHandler instead");
                 return;
@@ -817,7 +838,7 @@ namespace Mirror
                 return;
             }
 
-            Guid assetId = identity.assetId;
+            uint assetId = identity.assetId;
 
             prefabs.Remove(assetId);
             spawnHandlers.Remove(assetId);
@@ -831,7 +852,7 @@ namespace Mirror
         // prefab. This should be used when no prefab exists for the spawned
         // objects - such as when they are constructed dynamically at runtime
         // from configuration data.
-        public static void RegisterSpawnHandler(Guid assetId, SpawnDelegate spawnHandler, UnSpawnDelegate unspawnHandler)
+        public static void RegisterSpawnHandler(uint assetId, SpawnDelegate spawnHandler, UnSpawnDelegate unspawnHandler)
         {
             // We need this check here because we don't want a null handler in the lambda expression below
             if (spawnHandler == null)
@@ -849,7 +870,7 @@ namespace Mirror
         // prefab. This should be used when no prefab exists for the spawned
         // objects - such as when they are constructed dynamically at runtime
         // from configuration data.
-        public static void RegisterSpawnHandler(Guid assetId, SpawnHandlerDelegate spawnHandler, UnSpawnDelegate unspawnHandler)
+        public static void RegisterSpawnHandler(uint assetId, SpawnHandlerDelegate spawnHandler, UnSpawnDelegate unspawnHandler)
         {
             if (spawnHandler == null)
             {
@@ -863,9 +884,9 @@ namespace Mirror
                 return;
             }
 
-            if (assetId == Guid.Empty)
+            if (assetId == 0)
             {
-                Debug.LogError("Can not Register SpawnHandler for empty Guid");
+                Debug.LogError("Can not Register SpawnHandler for empty assetId");
                 return;
             }
 
@@ -887,7 +908,7 @@ namespace Mirror
         }
 
         /// <summary> Removes a registered spawn handler function that was registered with NetworkClient.RegisterHandler().</summary>
-        public static void UnregisterSpawnHandler(Guid assetId)
+        public static void UnregisterSpawnHandler(uint assetId)
         {
             spawnHandlers.Remove(assetId);
             unspawnHandlers.Remove(assetId);
@@ -901,7 +922,7 @@ namespace Mirror
             unspawnHandlers.Clear();
         }
 
-        internal static bool InvokeUnSpawnHandler(Guid assetId, GameObject obj)
+        internal static bool InvokeUnSpawnHandler(uint assetId, GameObject obj)
         {
             if (unspawnHandlers.TryGetValue(assetId, out UnSpawnDelegate handler) && handler != null)
             {
@@ -999,7 +1020,7 @@ namespace Mirror
         // spawning ////////////////////////////////////////////////////////////
         internal static void ApplySpawnPayload(NetworkIdentity identity, SpawnMessage message)
         {
-            if (message.assetId != Guid.Empty)
+            if (message.assetId != 0)
                 identity.assetId = message.assetId;
 
             if (!identity.gameObject.activeSelf)
@@ -1011,7 +1032,7 @@ namespace Mirror
             identity.transform.localPosition = message.position;
             identity.transform.localRotation = message.rotation;
             identity.transform.localScale = message.scale;
-            identity.hasAuthority = message.isOwner;
+            identity.isOwned = message.isOwner;
             identity.netId = message.netId;
 
             if (message.isLocalPlayer)
@@ -1023,11 +1044,12 @@ namespace Mirror
             {
                 using (NetworkReaderPooled payloadReader = NetworkReaderPool.Get(message.payload))
                 {
-                    identity.OnDeserializeAllSafely(payloadReader, true);
+                    identity.DeserializeClient(payloadReader, true);
                 }
             }
 
             spawned[message.netId] = identity;
+            if (identity.isOwned) connection?.owned.Add(identity);
 
             // the initial spawn with OnObjectSpawnStarted/Finished calls all
             // object's OnStartClient/OnStartLocalPlayer after they were all
@@ -1055,7 +1077,7 @@ namespace Mirror
                 return true;
             }
 
-            if (message.assetId == Guid.Empty && message.sceneId == 0)
+            if (message.assetId == 0 && message.sceneId == 0)
             {
                 Debug.LogError($"OnSpawn message with netId '{message.netId}' has no AssetId or sceneId");
                 return false;
@@ -1074,8 +1096,8 @@ namespace Mirror
 
         static NetworkIdentity GetExistingObject(uint netid)
         {
-            spawned.TryGetValue(netid, out NetworkIdentity localObject);
-            return localObject;
+            spawned.TryGetValue(netid, out NetworkIdentity identity);
+            return identity;
         }
 
         static NetworkIdentity SpawnPrefab(SpawnMessage message)
@@ -1141,16 +1163,6 @@ namespace Mirror
             return null;
         }
 
-        // Checks if identity is not spawned yet, not hidden and has sceneId
-        static bool ConsiderForSpawning(NetworkIdentity identity)
-        {
-            // not spawned yet, not hidden, etc.?
-            return !identity.gameObject.activeSelf &&
-                   identity.gameObject.hideFlags != HideFlags.NotEditable &&
-                   identity.gameObject.hideFlags != HideFlags.HideAndDontSave &&
-                   identity.sceneId != 0;
-        }
-
         /// <summary>Call this after loading/unloading a scene in the client after connection to register the spawnable objects</summary>
         public static void PrepareToSpawnSceneObjects()
         {
@@ -1162,9 +1174,23 @@ namespace Mirror
             foreach (NetworkIdentity identity in allIdentities)
             {
                 // add all unspawned NetworkIdentities to spawnable objects
-                if (ConsiderForSpawning(identity))
+                // need to ensure it's not active yet because
+                // PrepareToSpawnSceneObjects may be called multiple times in case
+                // the ObjectSpawnStarted message is received multiple times.
+                if (Utils.IsSceneObject(identity) &&
+                    !identity.gameObject.activeSelf)
                 {
-                    spawnableObjects.Add(identity.sceneId, identity);
+                    if (spawnableObjects.TryGetValue(identity.sceneId, out NetworkIdentity existingIdentity))
+                    {
+                        string msg = $"NetworkClient: Duplicate sceneId {identity.sceneId} detected on {identity.gameObject.name} and {existingIdentity.gameObject.name}\n" +
+                            $"This can happen if a networked object is persisted in DontDestroyOnLoad through loading / changing to the scene where it originated,\n" +
+                            $"otherwise you may need to open and re-save the {identity.gameObject.scene} to reset scene id's.";
+                        Debug.LogWarning(msg, identity.gameObject);
+                    }
+                    else
+                    {
+                        spawnableObjects.Add(identity.sceneId, identity);
+                    }
                 }
             }
         }
@@ -1221,17 +1247,22 @@ namespace Mirror
         static void OnHostClientObjectDestroy(ObjectDestroyMessage message)
         {
             //Debug.Log($"NetworkClient.OnLocalObjectObjDestroy netId:{message.netId}");
+
+            // remove from owned (if any)
+            if (spawned.TryGetValue(message.netId, out NetworkIdentity identity))
+                connection.owned.Remove(identity);
+
             spawned.Remove(message.netId);
         }
 
         static void OnHostClientObjectHide(ObjectHideMessage message)
         {
             //Debug.Log($"ClientScene::OnLocalObjectObjHide netId:{message.netId}");
-            if (spawned.TryGetValue(message.netId, out NetworkIdentity localObject) &&
-                localObject != null)
+            if (spawned.TryGetValue(message.netId, out NetworkIdentity identity) &&
+                identity != null)
             {
                 if (aoi != null)
-                    aoi.SetHostVisibility(localObject, false);
+                    aoi.SetHostVisibility(identity, false);
             }
         }
 
@@ -1239,22 +1270,23 @@ namespace Mirror
         {
             // on host mode, the object already exist in NetworkServer.spawned.
             // simply add it to NetworkClient.spawned too.
-            if (NetworkServer.spawned.TryGetValue(message.netId, out NetworkIdentity localObject) && localObject != null)
+            if (NetworkServer.spawned.TryGetValue(message.netId, out NetworkIdentity identity) && identity != null)
             {
-                spawned[message.netId] = localObject;
+                spawned[message.netId] = identity;
+                if (message.isOwner) connection.owned.Add(identity);
 
                 // now do the actual 'spawning' on host mode
                 if (message.isLocalPlayer)
-                    InternalAddPlayer(localObject);
+                    InternalAddPlayer(identity);
 
-                localObject.hasAuthority = message.isOwner;
-                localObject.NotifyAuthority();
-                localObject.OnStartClient();
+                identity.isOwned = message.isOwner;
+                identity.NotifyAuthority();
+                identity.OnStartClient();
 
                 if (aoi != null)
-                    aoi.SetHostVisibility(localObject, true);
+                    aoi.SetHostVisibility(identity, true);
 
-                CheckForLocalPlayer(localObject);
+                CheckForLocalPlayer(identity);
             }
         }
 
@@ -1262,22 +1294,23 @@ namespace Mirror
         static void OnEntityStateMessage(EntityStateMessage message)
         {
             // Debug.Log($"NetworkClient.OnUpdateVarsMessage {msg.netId}");
-            if (spawned.TryGetValue(message.netId, out NetworkIdentity localObject) && localObject != null)
+            if (spawned.TryGetValue(message.netId, out NetworkIdentity identity) && identity != null)
             {
-                using (NetworkReaderPooled networkReader = NetworkReaderPool.Get(message.payload))
-                    localObject.OnDeserializeAllSafely(networkReader, false);
+                using (NetworkReaderPooled reader = NetworkReaderPool.Get(message.payload))
+                    identity.DeserializeClient(reader, false);
             }
             else Debug.LogWarning($"Did not find target for sync message for {message.netId} . Note: this can be completely normal because UDP messages may arrive out of order, so this message might have arrived after a Destroy message.");
         }
 
         static void OnRPCMessage(RpcMessage message)
         {
-            // Debug.Log($"NetworkClient.OnRPCMessage hash:{msg.functionHash} netId:{msg.netId}");
+            // Debug.Log($"NetworkClient.OnRPCMessage hash:{message.functionHash} netId:{message.netId}");
             if (spawned.TryGetValue(message.netId, out NetworkIdentity identity))
             {
-                using (NetworkReaderPooled networkReader = NetworkReaderPool.Get(message.payload))
-                    identity.HandleRemoteCall(message.componentIndex, message.functionHash, RemoteCallType.ClientRpc, networkReader);
+                using (NetworkReaderPooled reader = NetworkReaderPool.Get(message.payload))
+                    identity.HandleRemoteCall(message.componentIndex, message.functionHash, RemoteCallType.ClientRpc, reader);
             }
+            // Rpcs often can't be applied if interest management unspawned them
         }
 
         static void OnObjectHide(ObjectHideMessage message) => DestroyObject(message.netId);
@@ -1315,7 +1348,7 @@ namespace Mirror
             }
 
             // set ownership flag (aka authority)
-            identity.hasAuthority = message.isOwner;
+            identity.isOwned = message.isOwner;
             identity.NotifyAuthority();
 
             // set localPlayer flag
@@ -1353,38 +1386,95 @@ namespace Mirror
         static void DestroyObject(uint netId)
         {
             // Debug.Log($"NetworkClient.OnObjDestroy netId: {netId}");
-            if (spawned.TryGetValue(netId, out NetworkIdentity localObject) && localObject != null)
+            if (spawned.TryGetValue(netId, out NetworkIdentity identity) && identity != null)
             {
-                if (localObject.isLocalPlayer)
-                    localObject.OnStopLocalPlayer();
+                if (identity.isLocalPlayer)
+                    identity.OnStopLocalPlayer();
 
-                localObject.OnStopClient();
+                identity.OnStopClient();
 
                 // custom unspawn handler for this prefab? (for prefab pools etc.)
-                if (InvokeUnSpawnHandler(localObject.assetId, localObject.gameObject))
+                if (InvokeUnSpawnHandler(identity.assetId, identity.gameObject))
                 {
                     // reset object after user's handler
-                    localObject.Reset();
+                    identity.Reset();
                 }
                 // otherwise fall back to default Destroy
-                else if (localObject.sceneId == 0)
+                else if (identity.sceneId == 0)
                 {
                     // don't call reset before destroy so that values are still set in OnDestroy
-                    GameObject.Destroy(localObject.gameObject);
+                    GameObject.Destroy(identity.gameObject);
                 }
                 // scene object.. disable it in scene instead of destroying
                 else
                 {
-                    localObject.gameObject.SetActive(false);
-                    spawnableObjects[localObject.sceneId] = localObject;
+                    identity.gameObject.SetActive(false);
+                    spawnableObjects[identity.sceneId] = identity;
                     // reset for scene objects
-                    localObject.Reset();
+                    identity.Reset();
                 }
 
                 // remove from dictionary no matter how it is unspawned
+                connection.owned.Remove(identity); // if any
                 spawned.Remove(netId);
             }
             //else Debug.LogWarning($"Did not find target for destroy message for {netId}");
+        }
+
+        // broadcast ///////////////////////////////////////////////////////////
+        static void BroadcastTimeSnapshot()
+        {
+            Send(new TimeSnapshotMessage(), Channels.Unreliable);
+        }
+
+        // make sure Broadcast() is only called every sendInterval.
+        // calling it every update() would require too much bandwidth.
+        static void Broadcast()
+        {
+            // joined the world yet?
+            if (!connection.isReady) return;
+
+            // nothing to do in host mode. server already knows the state.
+            if (NetworkServer.active) return;
+
+            // send time snapshot every sendInterval.
+            BroadcastTimeSnapshot();
+
+            // for each entity that the client owns
+            foreach (NetworkIdentity identity in connection.owned)
+            {
+                // make sure it's not null or destroyed.
+                // (which can happen if someone uses
+                //  GameObject.Destroy instead of
+                //  NetworkServer.Destroy)
+                if (identity != null)
+                {
+                    using (NetworkWriterPooled writer = NetworkWriterPool.Get())
+                    {
+                        // get serialization for this entity viewed by this connection
+                        // (if anything was serialized this time)
+                        identity.SerializeClient(writer);
+                        if (writer.Position > 0)
+                        {
+                            // send state update message
+                            EntityStateMessage message = new EntityStateMessage
+                            {
+                                netId = identity.netId,
+                                payload = writer.ToArraySegment()
+                            };
+                            Send(message);
+
+                            // reset dirty bits so it's not resent next time.
+                            identity.ClearDirtyComponentsDirtyBits();
+                        }
+                    }
+                }
+                // spawned list should have no null entries because we
+                // always call Remove in OnObjectDestroy everywhere.
+                // if it does have null then someone used
+                // GameObject.Destroy instead of NetworkServer.Destroy.
+                else Debug.LogWarning($"Found 'null' entry in observing list for connectionId={connection.connectionId}. Please call NetworkServer.Destroy to destroy networked objects. Don't use GameObject.Destroy.");
+            }
         }
 
         // update //////////////////////////////////////////////////////////////
@@ -1393,14 +1483,52 @@ namespace Mirror
         internal static void NetworkEarlyUpdate()
         {
             // process all incoming messages first before updating the world
-            if (Transport.activeTransport != null)
-                Transport.activeTransport.ClientEarlyUpdate();
+            if (Transport.active != null)
+                Transport.active.ClientEarlyUpdate();
+
+            // time snapshot interpolation
+            UpdateTimeInterpolation();
         }
 
         // NetworkLateUpdate called after any Update/FixedUpdate/LateUpdate
         // (we add this to the UnityEngine in NetworkLoop)
         internal static void NetworkLateUpdate()
         {
+            // broadcast ClientToServer components while active
+            // note that Broadcast() runs every update.
+            // on clients with 120 Hz, this will run 120 times per second.
+            // however, Broadcast only checks .owned, which usually aren't many.
+            //
+            // we could use a .sendInterval, but it would also put a minimum
+            // limit to every component's sendInterval automatically.
+            if (active)
+            {
+                // broadcast every sendInterval.
+                // AccurateInterval to avoid update frequency inaccuracy issues:
+                // https://github.com/vis2k/Mirror/pull/3153
+                //
+                // for example, host mode server doesn't set .targetFrameRate.
+                // Broadcast() would be called every tick.
+                // snapshots might be sent way too often, etc.
+                //
+                // during tests, we always call Broadcast() though.
+                //
+                // also important for syncInterval=0 components like
+                // NetworkTransform, so they can sync on same interval as time
+                // snapshots _but_ not every single tick.
+                if (!Application.isPlaying ||
+#if !UNITY_2020_3_OR_NEWER
+                    // Unity 2019 doesn't have Time.timeAsDouble yet
+                    AccurateInterval.Elapsed(NetworkTime.localTime, sendInterval, ref lastSendTime))
+#else
+                    AccurateInterval.Elapsed(Time.timeAsDouble, sendInterval, ref lastSendTime))
+#endif
+                {
+                    Broadcast();
+                }
+            }
+
+            // update connections to flush out messages _after_ broadcast
             // local connection?
             if (connection is LocalConnectionToServer localConnection)
             {
@@ -1421,8 +1549,8 @@ namespace Mirror
             }
 
             // process all outgoing messages after updating the world
-            if (Transport.activeTransport != null)
-                Transport.activeTransport.ClientLateUpdate();
+            if (Transport.active != null)
+                Transport.active.ClientLateUpdate();
         }
 
         // shutdown ////////////////////////////////////////////////////////////
@@ -1482,6 +1610,7 @@ namespace Mirror
                     }
                 }
                 spawned.Clear();
+                connection?.owned.Clear();
             }
             catch (InvalidOperationException e)
             {
@@ -1506,6 +1635,7 @@ namespace Mirror
             DestroyAllClientObjects();
 
             spawned.Clear();
+            connection?.owned.Clear();
             handlers.Clear();
             spawnableObjects.Clear();
 
@@ -1521,8 +1651,8 @@ namespace Mirror
             // we do NOT call Transport.Shutdown, because someone only called
             // NetworkClient.Shutdown. we can't assume that the server is
             // supposed to be shut down too!
-            if (Transport.activeTransport != null)
-                Transport.activeTransport.ClientDisconnect();
+            if (Transport.active != null)
+                Transport.active.ClientDisconnect();
 
             // reset statics
             connectState = ConnectState.None;
@@ -1539,6 +1669,30 @@ namespace Mirror
             OnConnectedEvent = null;
             OnDisconnectedEvent = null;
             OnErrorEvent = null;
+        }
+
+        // GUI /////////////////////////////////////////////////////////////////
+        // called from NetworkManager to display timeline interpolation status.
+        // useful to indicate catchup / slowdown / dynamic adjustment etc.
+        internal static void OnGUI()
+        {
+            // only if in world
+            if (!ready) return;
+
+            GUILayout.BeginArea(new Rect(10, 5, 400, 50));
+
+            GUILayout.BeginHorizontal("Box");
+            GUILayout.Label("Snapshot Interp.:");
+            // color while catching up / slowing down
+            if      (localTimescale > 1) GUI.color = Color.green; // green traffic light = go fast
+            else if (localTimescale < 1) GUI.color = Color.red;   // red traffic light = go slow
+            else                         GUI.color = Color.white;
+            GUILayout.Box($"timeline: {localTimeline:F2}");
+            GUILayout.Box($"buffer: {snapshots.Count}");
+            GUILayout.Box($"timescale: {localTimescale:F2}");
+            GUILayout.EndHorizontal();
+
+            GUILayout.EndArea();
         }
     }
 }

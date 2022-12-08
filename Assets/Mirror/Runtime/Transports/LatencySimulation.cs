@@ -9,6 +9,7 @@
 using System;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Serialization;
 
 namespace Mirror
 {
@@ -16,7 +17,7 @@ namespace Mirror
     {
         public int connectionId;
         public byte[] bytes;
-        public float time;
+        public double time;
     }
 
     [HelpURL("https://mirror-networking.gitbook.io/docs/transports/latency-simulaton-transport")]
@@ -26,10 +27,12 @@ namespace Mirror
         public Transport wrap;
 
         [Header("Common")]
-        [Tooltip("Spike latency via perlin(Time * speedMultiplier) * spikeMultiplier")]
-        [Range(0, 1)] public float latencySpikeMultiplier;
-        [Tooltip("Spike latency via perlin(Time * speedMultiplier) * spikeMultiplier")]
-        public float latencySpikeSpeedMultiplier = 1;
+        [Tooltip("Jitter latency via perlin(Time * jitterSpeed) * jitter")]
+        [FormerlySerializedAs("latencySpikeMultiplier")]
+        [Range(0, 1)] public float jitter;
+        [Tooltip("Jitter latency via perlin(Time * jitterSpeed) * jitter")]
+        [FormerlySerializedAs("latencySpikeSpeedMultiplier")]
+        public float jitterSpeed = 1;
 
         [Header("Reliable Messages")]
         [Tooltip("Reliable latency in seconds")]
@@ -63,7 +66,7 @@ namespace Mirror
         public void Awake()
         {
             if (wrap == null)
-                throw new Exception("PressureDrop requires an underlying transport to wrap around.");
+                throw new Exception("LatencySimulationTransport requires an underlying transport to wrap around.");
         }
 
         // forward enable/disable to the wrapped transport
@@ -80,7 +83,11 @@ namespace Mirror
             // no spikes isn't realistic.
             // sin is too predictable / no realistic.
             // perlin is still deterministic and random enough.
-            float spike = Noise(Time.unscaledTime * latencySpikeSpeedMultiplier) * latencySpikeMultiplier;
+#if !UNITY_2020_3_OR_NEWER
+            float spike = Noise((float)NetworkTime.localTime * jitterSpeed) * jitter;
+#else
+            float spike = Noise((float)Time.unscaledTimeAsDouble * jitterSpeed) * jitter;
+#endif
 
             // base latency
             switch (channeldId)
@@ -95,7 +102,13 @@ namespace Mirror
         }
 
         // helper function to simulate a send with latency/loss/scramble
-        void SimulateSend(int connectionId, ArraySegment<byte> segment, int channelId, float latency, List<QueuedMessage> reliableQueue, List<QueuedMessage> unreliableQueue)
+        void SimulateSend(
+            int connectionId,
+            ArraySegment<byte> segment,
+            int channelId,
+            float latency,
+            List<QueuedMessage> reliableQueue,
+            List<QueuedMessage> unreliableQueue)
         {
             // segment is only valid after returning. copy it.
             // (allocates for now. it's only for testing anyway.)
@@ -107,7 +120,11 @@ namespace Mirror
             {
                 connectionId = connectionId,
                 bytes = bytes,
-                time = Time.unscaledTime + latency
+#if !UNITY_2020_3_OR_NEWER
+                time = NetworkTime.localTime + latency
+#else
+                time = Time.unscaledTimeAsDouble + latency
+#endif
             };
 
             switch (channelId)
@@ -140,18 +157,18 @@ namespace Mirror
 
         public override void ClientConnect(string address)
         {
-            wrap.OnClientConnected = OnClientConnected;
+            wrap.OnClientConnected    = OnClientConnected;
             wrap.OnClientDataReceived = OnClientDataReceived;
-            wrap.OnClientError = OnClientError;
+            wrap.OnClientError        = OnClientError;
             wrap.OnClientDisconnected = OnClientDisconnected;
             wrap.ClientConnect(address);
         }
 
         public override void ClientConnect(Uri uri)
         {
-            wrap.OnClientConnected = OnClientConnected;
+            wrap.OnClientConnected    = OnClientConnected;
             wrap.OnClientDataReceived = OnClientDataReceived;
-            wrap.OnClientError = OnClientError;
+            wrap.OnClientError        = OnClientError;
             wrap.OnClientDisconnected = OnClientDisconnected;
             wrap.ClientConnect(uri);
         }
@@ -205,34 +222,42 @@ namespace Mirror
         public override void ServerEarlyUpdate() => wrap.ServerEarlyUpdate();
         public override void ClientLateUpdate()
         {
-            // flush reliable messages after latency
-            while (reliableClientToServer.Count > 0)
+            // flush reliable messages after latency.
+            // need to iterate all, since queue isn't a sortedlist.
+            for (int i = 0; i < reliableClientToServer.Count; ++i)
             {
-                // check the first message time
-                QueuedMessage message = reliableClientToServer[0];
-                if (message.time <= Time.unscaledTime)
+                // message ready to be sent?
+                QueuedMessage message = reliableClientToServer[i];
+#if !UNITY_2020_3_OR_NEWER
+                if (message.time <= NetworkTime.localTime)
+#else
+                if (message.time <= Time.unscaledTimeAsDouble)
+#endif
                 {
                     // send and eat
                     wrap.ClientSend(new ArraySegment<byte>(message.bytes), Channels.Reliable);
-                    reliableClientToServer.RemoveAt(0);
+                    reliableClientToServer.RemoveAt(i);
+                    --i;
                 }
-                // not enough time elapsed yet
-                break;
             }
 
-            // flush unreliable messages after latency
-            while (unreliableClientToServer.Count > 0)
+            // flush unreliable messages after latency.
+            // need to iterate all, since queue isn't a sortedlist.
+            for (int i = 0; i < unreliableClientToServer.Count; ++i)
             {
-                // check the first message time
-                QueuedMessage message = unreliableClientToServer[0];
-                if (message.time <= Time.unscaledTime)
+                // message ready to be sent?
+                QueuedMessage message = unreliableClientToServer[i];
+#if !UNITY_2020_3_OR_NEWER
+                if (message.time <= NetworkTime.localTime)
+#else
+                if (message.time <= Time.unscaledTimeAsDouble)
+#endif
                 {
                     // send and eat
-                    wrap.ClientSend(new ArraySegment<byte>(message.bytes), Channels.Unreliable);
-                    unreliableClientToServer.RemoveAt(0);
+                    wrap.ClientSend(new ArraySegment<byte>(message.bytes), Channels.Reliable);
+                    unreliableClientToServer.RemoveAt(i);
+                    --i;
                 }
-                // not enough time elapsed yet
-                break;
             }
 
             // update wrapped transport too
@@ -240,34 +265,44 @@ namespace Mirror
         }
         public override void ServerLateUpdate()
         {
-            // flush reliable messages after latency
-            while (reliableServerToClient.Count > 0)
+
+            // flush reliable messages after latency.
+            // need to iterate all, since queue isn't a sortedlist.
+            for (int i = 0; i < reliableServerToClient.Count; ++i)
             {
-                // check the first message time
-                QueuedMessage message = reliableServerToClient[0];
-                if (message.time <= Time.unscaledTime)
+                // message ready to be sent?
+                QueuedMessage message = reliableServerToClient[i];
+#if !UNITY_2020_3_OR_NEWER
+                if (message.time <= NetworkTime.localTime)
+#else
+                if (message.time <= Time.unscaledTimeAsDouble)
+#endif
                 {
                     // send and eat
                     wrap.ServerSend(message.connectionId, new ArraySegment<byte>(message.bytes), Channels.Reliable);
-                    reliableServerToClient.RemoveAt(0);
+                    reliableServerToClient.RemoveAt(i);
+                    --i;
                 }
-                // not enough time elapsed yet
-                break;
             }
 
-            // flush unreliable messages after latency
-            while (unreliableServerToClient.Count > 0)
+
+            // flush unreliable messages after latency.
+            // need to iterate all, since queue isn't a sortedlist.
+            for (int i = 0; i < unreliableServerToClient.Count; ++i)
             {
-                // check the first message time
-                QueuedMessage message = unreliableServerToClient[0];
-                if (message.time <= Time.unscaledTime)
+                // message ready to be sent?
+                QueuedMessage message = unreliableServerToClient[i];
+#if !UNITY_2020_3_OR_NEWER
+                if (message.time <= NetworkTime.localTime)
+#else
+                if (message.time <= Time.unscaledTimeAsDouble)
+#endif
                 {
                     // send and eat
-                    wrap.ServerSend(message.connectionId, new ArraySegment<byte>(message.bytes), Channels.Unreliable);
-                    unreliableServerToClient.RemoveAt(0);
+                    wrap.ServerSend(message.connectionId, new ArraySegment<byte>(message.bytes), Channels.Reliable);
+                    unreliableServerToClient.RemoveAt(i);
+                    --i;
                 }
-                // not enough time elapsed yet
-                break;
             }
 
             // update wrapped transport too

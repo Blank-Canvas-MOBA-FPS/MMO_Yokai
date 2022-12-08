@@ -1,35 +1,112 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using UnityEngine;
 
 namespace Mirror
 {
     public class NetworkConnectionToClient : NetworkConnection
     {
         public override string address =>
-            Transport.activeTransport.ServerGetClientAddress(connectionId);
+            Transport.active.ServerGetClientAddress(connectionId);
 
         /// <summary>NetworkIdentities that this connection can see</summary>
         // TODO move to server's NetworkConnectionToClient?
         public new readonly HashSet<NetworkIdentity> observing = new HashSet<NetworkIdentity>();
 
-        /// <summary>All NetworkIdentities owned by this connection. Can be main player, pets, etc.</summary>
-        // IMPORTANT: this needs to be <NetworkIdentity>, not <uint netId>.
-        //            fixes a bug where DestroyOwnedObjects wouldn't find the
-        //            netId anymore: https://github.com/vis2k/Mirror/issues/1380
-        //            Works fine with NetworkIdentity pointers though.
-        public new readonly HashSet<NetworkIdentity> clientOwnedObjects = new HashSet<NetworkIdentity>();
+        [Obsolete(".clientOwnedObjects was renamed to .owned :)")] // 2022-10-13
+        public new HashSet<NetworkIdentity> clientOwnedObjects => owned;
 
         // unbatcher
         public Unbatcher unbatcher = new Unbatcher();
 
+        // server runs a time snapshot interpolation for each client's local time.
+        // this is necessary for client auth movement to still be smooth on the
+        // server for host mode.
+        // TODO move them along server's timeline in the future.
+        //      perhaps with an offset.
+        //      for now, keep compatibility by manually constructing a timeline.
+        ExponentialMovingAverage driftEma;
+        ExponentialMovingAverage deliveryTimeEma; // average delivery time (standard deviation gives average jitter)
+        public double remoteTimeline;
+        public double remoteTimescale;
+        double bufferTimeMultiplier = 2;
+        double bufferTime => NetworkServer.sendInterval * bufferTimeMultiplier;
+
+        // <clienttime, snaps>
+        readonly SortedList<double, TimeSnapshot> snapshots = new SortedList<double, TimeSnapshot>();
+
+        // Snapshot Buffer size limit to avoid ever growing list memory consumption attacks from clients.
+        public int snapshotBufferSizeLimit = 64;
+
         public NetworkConnectionToClient(int networkConnectionId)
-            : base(networkConnectionId) {}
+            : base(networkConnectionId)
+        {
+            // initialize EMA with 'emaDuration' seconds worth of history.
+            // 1 second holds 'sendRate' worth of values.
+            // multiplied by emaDuration gives n-seconds.
+            driftEma        = new ExponentialMovingAverage(NetworkServer.sendRate * NetworkClient.driftEmaDuration);
+            deliveryTimeEma = new ExponentialMovingAverage(NetworkServer.sendRate * NetworkClient.deliveryTimeEmaDuration);
+
+            // buffer limit should be at least multiplier to have enough in there
+            snapshotBufferSizeLimit = Mathf.Max((int)NetworkClient.bufferTimeMultiplier, snapshotBufferSizeLimit);
+        }
+
+        public void OnTimeSnapshot(TimeSnapshot snapshot)
+        {
+            // protect against ever growing buffer size attacks
+            if (snapshots.Count >= snapshotBufferSizeLimit) return;
+
+            // (optional) dynamic adjustment
+            if (NetworkClient.dynamicAdjustment)
+            {
+                // set bufferTime on the fly.
+                // shows in inspector for easier debugging :)
+                bufferTimeMultiplier = SnapshotInterpolation.DynamicAdjustment(
+                    NetworkServer.sendInterval,
+                    deliveryTimeEma.StandardDeviation,
+                    NetworkClient.dynamicAdjustmentTolerance
+                );
+                // Debug.Log($"[Server]: {name} delivery std={serverDeliveryTimeEma.StandardDeviation} bufferTimeMult := {bufferTimeMultiplier} ");
+            }
+
+            // insert into the server buffer & initialize / adjust / catchup
+            SnapshotInterpolation.InsertAndAdjust(
+                snapshots,
+                snapshot,
+                ref remoteTimeline,
+                ref remoteTimescale,
+                NetworkServer.sendInterval,
+                bufferTime,
+                NetworkClient.catchupSpeed,
+                NetworkClient.slowdownSpeed,
+                ref driftEma,
+                NetworkClient.catchupNegativeThreshold,
+                NetworkClient.catchupPositiveThreshold,
+                ref deliveryTimeEma
+            );
+        }
+
+        public void UpdateTimeInterpolation()
+        {
+            // timeline starts when the first snapshot arrives.
+            if (snapshots.Count > 0)
+            {
+                // progress local timeline.
+                SnapshotInterpolation.StepTime(Time.unscaledDeltaTime, ref remoteTimeline, remoteTimescale);
+
+                // progress local interpolation.
+                // TimeSnapshot doesn't interpolate anything.
+                // this is merely to keep removing older snapshots.
+                SnapshotInterpolation.StepInterpolation(snapshots, remoteTimeline, out _, out _, out _);
+                // Debug.Log($"NetworkClient SnapshotInterpolation @ {localTimeline:F2} t={t:F2}");
+            }
+        }
 
         // Send stage three: hand off to transport
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         protected override void SendToTransport(ArraySegment<byte> segment, int channelId = Channels.Reliable) =>
-            Transport.activeTransport.ServerSend(connectionId, segment, channelId);
+            Transport.active.ServerSend(connectionId, segment, channelId);
 
         /// <summary>Disconnects this connection.</summary>
         public override void Disconnect()
@@ -37,7 +114,7 @@ namespace Mirror
             // set not ready and handle clientscene disconnect in any case
             // (might be client or host mode here)
             isReady = false;
-            Transport.activeTransport.ServerDisconnect(connectionId);
+            Transport.active.ServerDisconnect(connectionId);
 
             // IMPORTANT: NetworkConnection.Disconnect() is NOT called for
             // voluntary disconnects from the other end.
@@ -76,18 +153,18 @@ namespace Mirror
 
         internal void AddOwnedObject(NetworkIdentity obj)
         {
-            clientOwnedObjects.Add(obj);
+            owned.Add(obj);
         }
 
         internal void RemoveOwnedObject(NetworkIdentity obj)
         {
-            clientOwnedObjects.Remove(obj);
+            owned.Remove(obj);
         }
 
         internal void DestroyOwnedObjects()
         {
             // create a copy because the list might be modified when destroying
-            HashSet<NetworkIdentity> tmp = new HashSet<NetworkIdentity>(clientOwnedObjects);
+            HashSet<NetworkIdentity> tmp = new HashSet<NetworkIdentity>(owned);
             foreach (NetworkIdentity netIdentity in tmp)
             {
                 if (netIdentity != null)
@@ -97,7 +174,7 @@ namespace Mirror
             }
 
             // clear the hashset because we destroyed them all
-            clientOwnedObjects.Clear();
+            owned.Clear();
         }
     }
 }

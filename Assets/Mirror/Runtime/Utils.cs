@@ -9,7 +9,7 @@ namespace Mirror
     public delegate void NetworkMessageDelegate(NetworkConnection conn, NetworkReader reader, int channelId);
 
     // Handles requests to spawn objects on the client
-    public delegate GameObject SpawnDelegate(Vector3 position, Guid assetId);
+    public delegate GameObject SpawnDelegate(Vector3 position, uint assetId);
 
     public delegate GameObject SpawnHandlerDelegate(SpawnMessage msg);
 
@@ -49,6 +49,22 @@ namespace Mirror
 #else
             return false;
 #endif
+        }
+
+        // simplified IsSceneObject check from Mirror II
+        public static bool IsSceneObject(NetworkIdentity identity)
+        {
+            // original UNET / Mirror still had the IsPersistent check.
+            // it never fires though. even for Prefabs dragged to the Scene.
+            // (see Scene Objects example scene.)
+            // #if UNITY_EDITOR
+            //             if (UnityEditor.EditorUtility.IsPersistent(identity.gameObject))
+            //                 return false;
+            // #endif
+
+            return identity.gameObject.hideFlags != HideFlags.NotEditable &&
+                identity.gameObject.hideFlags != HideFlags.HideAndDontSave &&
+                identity.sceneId != 0;
         }
 
         public static bool IsSceneObjectWithPrefabParent(GameObject gameObject, out GameObject prefab)
@@ -96,6 +112,23 @@ namespace Mirror
             return $"{(bytes / (1024f * 1024f * 1024f)):F2} GB";
         }
 
+        // pretty print seconds as hours:minutes:seconds(.milliseconds/100)s.
+        // double for long running servers.
+        public static string PrettySeconds(double seconds)
+        {
+            TimeSpan t = TimeSpan.FromSeconds(seconds);
+            string res = "";
+            if (t.Days > 0) res += $"{t.Days}d";
+            if (t.Hours > 0) res += $"{(res.Length > 0 ? " " : "")}{t.Hours}h";
+            if (t.Minutes > 0) res += $"{(res.Length > 0 ? " " : "")}{t.Minutes}m";
+            // 0.5s, 1.5s etc. if any milliseconds. 1s, 2s etc. if any seconds
+            if (t.Milliseconds > 0) res += $"{(res.Length > 0 ? " " : "")}{t.Seconds}.{(t.Milliseconds / 100)}s";
+            else if (t.Seconds > 0) res += $"{(res.Length > 0 ? " " : "")}{t.Seconds}s";
+            // if the string is still empty because the value was '0', then at least
+            // return the seconds instead of returning an empty string
+            return res != "" ? res : "0s";
+        }
+
         // universal .spawned function
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static NetworkIdentity GetSpawnedInServerOrClient(uint netId)
@@ -116,6 +149,22 @@ namespace Mirror
             }
 
             return null;
+        }
+
+        // keep a GUI window in screen.
+        // for example. if it's at x=1000 and screen is resized to w=500,
+        // it won't get lost in the invisible area etc.
+        public static Rect KeepInScreen(Rect rect)
+        {
+            // ensure min
+            rect.x = Math.Max(rect.x, 0);
+            rect.y = Math.Max(rect.y, 0);
+
+            // ensure max
+            rect.x = Math.Min(rect.x, Screen.width - rect.width);
+            rect.y = Math.Min(rect.y, Screen.width - rect.height);
+
+            return rect;
         }
     }
 }

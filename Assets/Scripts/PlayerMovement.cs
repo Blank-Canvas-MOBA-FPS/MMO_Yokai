@@ -2,7 +2,7 @@ using Cinemachine;
 using Mirror;
 using UnityEngine;
 #if ENABLE_INPUT_SYSTEM && STARTER_ASSETS_PACKAGES_CHECKED
-using UnityEngine.InputSystem;
+    using UnityEngine.InputSystem;
 #endif
 
 /* Note: animations are called via the controller for both the character and capsule using animator null checks
@@ -11,9 +11,9 @@ using UnityEngine.InputSystem;
 namespace StarterAssets
 {
     [RequireComponent(typeof(CharacterController))]
-#if ENABLE_INPUT_SYSTEM && STARTER_ASSETS_PACKAGES_CHECKED
+    #if ENABLE_INPUT_SYSTEM && STARTER_ASSETS_PACKAGES_CHECKED
     [RequireComponent(typeof(PlayerInput))]
-#endif    
+    #endif    
     public class PlayerMovement : NetworkBehaviour
     {
         [Header("Player")]
@@ -100,9 +100,9 @@ namespace StarterAssets
         private int _animIDFreeFall;
         private int _animIDMotionSpeed;
 
-#if ENABLE_INPUT_SYSTEM && STARTER_ASSETS_PACKAGES_CHECKED
-        private PlayerInput _playerInput;
-#endif
+        #if ENABLE_INPUT_SYSTEM && STARTER_ASSETS_PACKAGES_CHECKED
+            private PlayerInput _playerInput;
+        #endif
         private Animator _animator;
         private CharacterController _controller;
         private StarterAssetsInputs _input;
@@ -112,15 +112,41 @@ namespace StarterAssets
 
         private bool _hasAnimator;
 
+
+        // PlayerName ------------------------------------------------------------
+        public TextMesh playerNameText;
+        public GameObject floatingInfo;
+        private Material playerMaterialClone;
+
+        [SyncVar(hook = nameof(OnNameChanged))]
+        public string playerName;
+
+        //[SyncVar(hook = nameof(OnColorChanged))]
+        public Color playerColor = Color.white;
+
+        void OnNameChanged(string _Old, string _New)
+        {
+            playerNameText.text = playerName;
+        }
+
+        /*void OnColorChanged(Color _Old, Color _New)
+        {
+            playerNameText.color = _New;
+            playerMaterialClone = new Material(GetComponent<Renderer>().material);
+            playerMaterialClone.color = _New;
+            GetComponent<Renderer>().material = playerMaterialClone;
+        }*/
+        //-----------------------------------------------------------------------------
+
         private bool IsCurrentDeviceMouse
         {
             get
             {
-#if ENABLE_INPUT_SYSTEM && STARTER_ASSETS_PACKAGES_CHECKED
+                #if ENABLE_INPUT_SYSTEM && STARTER_ASSETS_PACKAGES_CHECKED
                 return _playerInput.currentControlScheme == "KeyboardMouse";
-#else
+                #else
 				return false;
-#endif
+                #endif
             }
         }
 
@@ -137,6 +163,20 @@ namespace StarterAssets
         public override void OnStartLocalPlayer()
         {
             GameObject.FindGameObjectWithTag("PlayerFollowCamera").GetComponent<CinemachineVirtualCamera>().Follow = transform.GetChild(0).transform;
+
+            floatingInfo.transform.localPosition = new Vector3(0, -.3f, 0.6f);
+            floatingInfo.transform.localScale = new Vector3(0.1f, 0.1f, 0.1f);
+
+            string name = "Player" + Random.Range(100, 999);
+            Color color = new Color(Random.Range(0f, 1f), Random.Range(0f, 1f), Random.Range(0f, 1f));
+            CmdSetupPlayer(name, color);
+        }
+
+        [Command]
+        public void CmdSetupPlayer(string _name, Color _col)
+        {
+            playerName = _name;
+            playerColor = _col;
         }
 
         public override void OnStartAuthority()
@@ -154,11 +194,11 @@ namespace StarterAssets
             _hasAnimator = TryGetComponent(out _animator);
             _controller = GetComponent<CharacterController>();
             _input = GetComponent<StarterAssetsInputs>();
-#if ENABLE_INPUT_SYSTEM && STARTER_ASSETS_PACKAGES_CHECKED
-            _playerInput = GetComponent<PlayerInput>();
-#else
-			Debug.LogError( "Starter Assets package is missing dependencies. Please use Tools/Starter Assets/Reinstall Dependencies to fix it");
-#endif
+            #if ENABLE_INPUT_SYSTEM && STARTER_ASSETS_PACKAGES_CHECKED
+                _playerInput = GetComponent<PlayerInput>();
+            #else
+			    Debug.LogError( "Starter Assets package is missing dependencies. Please use Tools/Starter Assets/Reinstall Dependencies to fix it");
+            #endif
 
             AssignAnimationIDs();
 

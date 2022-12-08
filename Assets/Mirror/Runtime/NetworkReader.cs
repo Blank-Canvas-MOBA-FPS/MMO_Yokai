@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Text;
 using Unity.Collections.LowLevel.Unsafe;
 using UnityEngine;
 
@@ -10,57 +11,73 @@ namespace Mirror
     // Note: This class is intended to be extremely pedantic,
     // and throw exceptions whenever stuff is going slightly wrong.
     // The exceptions will be handled in NetworkServer/NetworkClient.
+    //
+    // Note that NetworkWriter can be passed in constructor thanks to implicit
+    // ArraySegment conversion:
+    //   NetworkReader reader = new NetworkReader(writer);
     public class NetworkReader
     {
         // internal buffer
         // byte[] pointer would work, but we use ArraySegment to also support
         // the ArraySegment constructor
-        ArraySegment<byte> buffer;
+        internal ArraySegment<byte> buffer;
 
         /// <summary>Next position to read from the buffer</summary>
         // 'int' is the best type for .Position. 'short' is too small if we send >32kb which would result in negative .Position
         // -> converting long to int is fine until 2GB of data (MAX_INT), so we don't have to worry about overflows here
         public int Position;
 
-        /// <summary>Total number of bytes to read from buffer</summary>
-        public int Length
-        {
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            get => buffer.Count;
-        }
-
         /// <summary>Remaining bytes that can be read, for convenience.</summary>
-        public int Remaining
-        {
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            get => Length - Position;
-        }
+        public int Remaining => buffer.Count - Position;
 
-        public NetworkReader(byte[] bytes)
-        {
-            buffer = new ArraySegment<byte>(bytes);
-        }
+        /// <summary>Total buffer capacity, independent of reader position.</summary>
+        public int Capacity => buffer.Count;
+
+        [Obsolete("NetworkReader.Length was renamed to Capacity")] // 2022-09-25
+        public int Length => Capacity;
+
+        // cache encoding for ReadString instead of creating it with each time
+        // 1000 readers before:  1MB GC, 30ms
+        // 1000 readers after: 0.8MB GC, 18ms
+        // member(!) to avoid static state.
+        //
+        // throwOnInvalidBytes is true.
+        // if false, it would silently ignore the invalid bytes but continue
+        // with the valid ones, creating strings like "a�������".
+        // instead, we want to catch it manually and return String.Empty.
+        // this is safer. see test: ReadString_InvalidUTF8().
+        internal readonly UTF8Encoding encoding = new UTF8Encoding(false, true);
 
         public NetworkReader(ArraySegment<byte> segment)
         {
             buffer = segment;
         }
 
+#if !UNITY_2021_3_OR_NEWER
+        // Unity 2019 doesn't have the implicit byte[] to segment conversion yet
+        public NetworkReader(byte[] bytes)
+        {
+            buffer = new ArraySegment<byte>(bytes, 0, bytes.Length);
+        }
+#endif
+
         // sometimes it's useful to point a reader on another buffer instead of
         // allocating a new reader (e.g. NetworkReaderPool)
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void SetBuffer(byte[] bytes)
-        {
-            buffer = new ArraySegment<byte>(bytes);
-            Position = 0;
-        }
-
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void SetBuffer(ArraySegment<byte> segment)
         {
             buffer = segment;
             Position = 0;
         }
+
+#if !UNITY_2021_3_OR_NEWER
+        // Unity 2019 doesn't have the implicit byte[] to segment conversion yet
+        public void SetBuffer(byte[] bytes)
+        {
+            buffer = new ArraySegment<byte>(bytes, 0, bytes.Length);
+            Position = 0;
+        }
+#endif
 
         // ReadBlittable<T> from DOTSNET
         // this is extremely fast, but only works for blittable types.
@@ -71,6 +88,26 @@ namespace Mirror
         // Note:
         //   ReadBlittable assumes same endianness for server & client.
         //   All Unity 2018+ platforms are little endian.
+        //
+        // This is not safe to expose to random structs.
+        //   * StructLayout.Sequential is the default, which is safe.
+        //     if the struct contains a reference type, it is converted to Auto.
+        //     but since all structs here are unmanaged blittable, it's safe.
+        //     see also: https://docs.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.layoutkind?view=netframework-4.8#system-runtime-interopservices-layoutkind-sequential
+        //   * StructLayout.Pack depends on CPU word size.
+        //     this may be different 4 or 8 on some ARM systems, etc.
+        //     this is not safe, and would cause bytes/shorts etc. to be padded.
+        //     see also: https://docs.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.structlayoutattribute.pack?view=net-6.0
+        //   * If we force pack all to '1', they would have no padding which is
+        //     great for bandwidth. but on some android systems, CPU can't read
+        //     unaligned memory.
+        //     see also: https://github.com/vis2k/Mirror/issues/3044
+        //   * The only option would be to force explicit layout with multiples
+        //     of word size. but this requires lots of weaver checking and is
+        //     still questionable (IL2CPP etc.).
+        //
+        // Note: inlining ReadBlittable is enough. don't inline ReadInt etc.
+        //       we don't want ReadBlittable to be copied in place everywhere.
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal unsafe T ReadBlittable<T>()
             where T : unmanaged
@@ -91,10 +128,10 @@ namespace Mirror
             // https://docs.microsoft.com/en-us/dotnet/standard/native-interop/best-practices
             int size = sizeof(T);
 
-            // enough data to read?
-            if (Position + size > buffer.Count)
+            // ensure remaining
+            if (Remaining < size)
             {
-                throw new EndOfStreamException($"ReadBlittable<{typeof(T)}> out of range: {ToString()}");
+                throw new EndOfStreamException($"ReadBlittable<{typeof(T)}> not enough data in buffer to read {size} bytes: {ToString()}");
             }
 
             // read blittable
@@ -132,23 +169,24 @@ namespace Mirror
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal T? ReadBlittableNullable<T>()
             where T : unmanaged =>
-                ReadByte() != 0 ? ReadBlittable<T>() : default(T?);
+            ReadByte() != 0 ? ReadBlittable<T>() : default(T?);
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public byte ReadByte() => ReadBlittable<byte>();
 
         /// <summary>Read 'count' bytes into the bytes array</summary>
         // NOTE: returns byte[] because all reader functions return something.
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public byte[] ReadBytes(byte[] bytes, int count)
         {
+            // user may call ReadBytes(ReadInt()). ensure positive count.
+            if (count < 0) throw new ArgumentOutOfRangeException("ReadBytes requires count >= 0");
+
             // check if passed byte array is big enough
             if (count > bytes.Length)
             {
                 throw new EndOfStreamException($"ReadBytes can't read {count} + bytes because the passed byte[] only has length {bytes.Length}");
             }
-            // check if within buffer limits
-            if (Position + count > buffer.Count)
+            // ensure remaining
+            if (Remaining < count)
             {
                 throw new EndOfStreamException($"ReadBytesSegment can't read {count} bytes because it would read past the end of the stream. {ToString()}");
             }
@@ -159,11 +197,13 @@ namespace Mirror
         }
 
         /// <summary>Read 'count' bytes allocation-free as ArraySegment that points to the internal array.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ArraySegment<byte> ReadBytesSegment(int count)
         {
-            // check if within buffer limits
-            if (Position + count > buffer.Count)
+            // user may call ReadBytes(ReadInt()). ensure positive count.
+            if (count < 0) throw new ArgumentOutOfRangeException("ReadBytesSegment requires count >= 0");
+
+            // ensure remaining
+            if (Remaining < count)
             {
                 throw new EndOfStreamException($"ReadBytesSegment can't read {count} bytes because it would read past the end of the stream. {ToString()}");
             }
@@ -174,10 +214,6 @@ namespace Mirror
             return result;
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public override string ToString() =>
-            $"NetworkReader pos={Position} len={Length} buffer={BitConverter.ToString(buffer.Array, buffer.Offset, buffer.Count)}";
-
         /// <summary>Reads any data type that mirror supports. Uses weaver populated Reader(T).read</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public T Read<T>()
@@ -185,11 +221,15 @@ namespace Mirror
             Func<NetworkReader, T> readerDelegate = Reader<T>.read;
             if (readerDelegate == null)
             {
-                Debug.LogError($"No reader found for {typeof(T)}. Use a type supported by Mirror or define a custom reader");
+                Debug.LogError($"No reader found for {typeof(T)}. Use a type supported by Mirror or define a custom reader extension for {typeof(T)}.");
                 return default;
             }
             return readerDelegate(this);
         }
+
+        // print the full buffer with position / capacity.
+        public override string ToString() =>
+            $"[{buffer.ToHexString()} @ {Position}/{Capacity}]";
     }
 
     /// <summary>Helper class that weaver populates with all reader types.</summary>

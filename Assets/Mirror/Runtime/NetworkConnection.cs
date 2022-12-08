@@ -41,14 +41,17 @@ namespace Mirror
         /// <summary>This connection's main object (usually the player object).</summary>
         public NetworkIdentity identity { get; internal set; }
 
+        // DEPRECATED 2022-02-05
+        [Obsolete("Cast to NetworkConnectionToClient to access .owned")]
+        public HashSet<NetworkIdentity> clientOwnedObjects => owned;
+
         /// <summary>All NetworkIdentities owned by this connection. Can be main player, pets, etc.</summary>
+        // .owned is now valid both on server and on client.
         // IMPORTANT: this needs to be <NetworkIdentity>, not <uint netId>.
         //            fixes a bug where DestroyOwnedObjects wouldn't find the
         //            netId anymore: https://github.com/vis2k/Mirror/issues/1380
         //            Works fine with NetworkIdentity pointers though.
-        // DEPRECATED 2022-02-05
-        [Obsolete("Cast to NetworkConnectionToClient to access .clientOwnedObjects")]
-        public HashSet<NetworkIdentity> clientOwnedObjects => ((NetworkConnectionToClient)this).clientOwnedObjects;
+        public readonly HashSet<NetworkIdentity> owned = new HashSet<NetworkIdentity>();
 
         // batching from server to client & client to server.
         // fewer transport calls give us significantly better performance/scale.
@@ -91,7 +94,7 @@ namespace Mirror
             if (!batches.TryGetValue(channelId, out batch))
             {
                 // get max batch size for this channel
-                int threshold = Transport.activeTransport.GetBatchThreshold(channelId);
+                int threshold = Transport.active.GetBatchThreshold(channelId);
 
                 // create batcher
                 batch = new Batcher(threshold);
@@ -107,7 +110,7 @@ namespace Mirror
         // => it's important to log errors, so the user knows what went wrong.
         protected static bool ValidatePacketSize(ArraySegment<byte> segment, int channelId)
         {
-            int max = Transport.activeTransport.GetMaxPacketSize(channelId);
+            int max = Transport.active.GetMaxPacketSize(channelId);
             if (segment.Count > max)
             {
                 Debug.LogError($"NetworkConnection.ValidatePacketSize: cannot send packet larger than {max} bytes, was {segment.Count} bytes");
@@ -134,7 +137,7 @@ namespace Mirror
             using (NetworkWriterPooled writer = NetworkWriterPool.Get())
             {
                 // pack message and send allocation free
-                MessagePacking.Pack(message, writer);
+                NetworkMessages.Pack(message, writer);
                 NetworkDiagnostics.OnSend(message, channelId, writer.Position, 1);
                 Send(writer.ToArraySegment(), channelId);
             }
@@ -175,15 +178,15 @@ namespace Mirror
         internal virtual void Update()
         {
             // go through batches for all channels
+            // foreach ((int key, Batcher batcher) in batches) // Unity 2020 doesn't support deconstruct yet
             foreach (KeyValuePair<int, Batcher> kvp in batches)
             {
                 // make and send as many batches as necessary from the stored
                 // messages.
-                Batcher batcher = kvp.Value;
                 using (NetworkWriterPooled writer = NetworkWriterPool.Get())
                 {
                     // make a batch with our local time (double precision)
-                    while (batcher.GetBatch(writer))
+                    while (kvp.Value.GetBatch(writer))
                     {
                         // validate packet before handing the batch to the
                         // transport. this guarantees that we always stay

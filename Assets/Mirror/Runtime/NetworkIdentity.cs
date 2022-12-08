@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using Mirror.RemoteCalls;
 using UnityEngine;
 using UnityEngine.Serialization;
@@ -88,8 +89,13 @@ namespace Mirror
         /// <summary>True if this object exists on a client that is not also acting as a server.</summary>
         public bool isClientOnly => isClient && !isServer;
 
+        /// <summary>isOwned is true on the client if this NetworkIdentity is one of the .owned entities of our connection on the server.</summary>
+        // for example: main player & pets are owned. monsters & npcs aren't.
+        public bool isOwned { get; internal set; }
+
         /// <summary>True on client if that component has been assigned to the client. E.g. player, pets, henchmen.</summary>
-        public bool hasAuthority { get; internal set; }
+        [Obsolete(".hasAuthority was renamed to .isOwned. This is easier to understand and prepares for SyncDirection, where there is a difference betwen isOwned and authority.")] // 2022-10-13
+        public bool hasAuthority => isOwned;
 
         /// <summary>The set of network connections (players) that can see this object.</summary>
         // note: null until OnStartServer was called. this is necessary for
@@ -103,6 +109,55 @@ namespace Mirror
         // persistent scene id <sceneHash/32,sceneId/32> (see AssignSceneID comments)
         [FormerlySerializedAs("m_SceneId"), HideInInspector]
         public ulong sceneId;
+
+        // assetId used to spawn prefabs across the network.
+        // originally a Guid, but a 4 byte uint is sufficient
+        // (as suggested by james)
+        //
+        // it's also easier to work with for serialization etc.
+        // serialized and visible in inspector for easier debugging
+        [SerializeField] uint _assetId;
+
+        // The AssetId trick:
+        //   Ideally we would have a serialized 'Guid m_AssetId' but Unity can't
+        //   serialize it because Guid's internal bytes are private
+        //
+        //   Using just the Guid string would work, but it's 32 chars long and
+        //   would then be sent over the network as 64 instead of 16 bytes
+        //
+        // => The solution is to serialize the string internally here and then
+        //    use the real 'Guid' type for everything else via .assetId
+        public uint assetId
+        {
+            get
+            {
+#if UNITY_EDITOR
+                // old UNET comment:
+                // This is important because sometimes OnValidate does not run
+                // (like when adding NetworkIdentity to prefab with no child links)
+                if (_assetId == 0)
+                    SetupIDs();
+#endif
+                return _assetId;
+            }
+            // assetId is set internally when creating or duplicating a prefab
+            internal set
+            {
+                // should never be empty
+                if (value == 0)
+                {
+                    Debug.LogError($"Can not set AssetId to empty guid on NetworkIdentity '{name}', old assetId '{_assetId}'");
+                    return;
+                }
+
+                // always set it otherwise.
+                // for new prefabs,        it will set from 0 to N.
+                // for duplicated prefabs, it will set from N to M.
+                // either way, it's always set to a valid GUID.
+                _assetId = value;
+                // Debug.Log($"Setting AssetId on NetworkIdentity '{name}', new assetId '{value:X4}'");
+            }
+        }
 
         /// <summary>Make this object only exist when the game is running as a server (or host).</summary>
         [FormerlySerializedAs("m_ServerOnly")]
@@ -159,6 +214,11 @@ namespace Mirror
         // get all NetworkBehaviour components
         public NetworkBehaviour[] NetworkBehaviours { get; private set; }
 
+        // to save bandwidth, we send one 64 bit dirty mask
+        // instead of 1 byte index per dirty component.
+        // which means we can't allow > 64 components (it's enough).
+        const int MaxNetworkBehaviours = 64;
+
         // current visibility
         //
         // Default = use interest management
@@ -182,65 +242,6 @@ namespace Mirror
             ownerWriter = new NetworkWriter(),
             observersWriter = new NetworkWriter()
         };
-
-        /// <summary>Prefab GUID used to spawn prefabs across the network.</summary>
-        //
-        // The AssetId trick:
-        //   Ideally we would have a serialized 'Guid m_AssetId' but Unity can't
-        //   serialize it because Guid's internal bytes are private
-        //
-        //   UNET used 'NetworkHash128' originally, with byte0, ..., byte16
-        //   which works, but it just unnecessary extra code
-        //
-        //   Using just the Guid string would work, but it's 32 chars long and
-        //   would then be sent over the network as 64 instead of 16 bytes
-        //
-        // => The solution is to serialize the string internally here and then
-        //    use the real 'Guid' type for everything else via .assetId
-        public Guid assetId
-        {
-            get
-            {
-#if UNITY_EDITOR
-                // This is important because sometimes OnValidate does not run (like when adding view to prefab with no child links)
-                if (string.IsNullOrWhiteSpace(m_AssetId))
-                    SetupIDs();
-#endif
-                // convert string to Guid and use .Empty to avoid exception if
-                // we would use 'new Guid("")'
-                return string.IsNullOrWhiteSpace(m_AssetId) ? Guid.Empty : new Guid(m_AssetId);
-            }
-            internal set
-            {
-                string newAssetIdString = value == Guid.Empty ? string.Empty : value.ToString("N");
-                string oldAssetIdString = m_AssetId;
-
-                // they are the same, do nothing
-                if (oldAssetIdString == newAssetIdString)
-                {
-                    return;
-                }
-
-                // new is empty
-                if (string.IsNullOrWhiteSpace(newAssetIdString))
-                {
-                    Debug.LogError($"Can not set AssetId to empty guid on NetworkIdentity '{name}', old assetId '{oldAssetIdString}'");
-                    return;
-                }
-
-                // old not empty
-                if (!string.IsNullOrWhiteSpace(oldAssetIdString))
-                {
-                    Debug.LogError($"Can not Set AssetId on NetworkIdentity '{name}' because it already had an assetId, current assetId '{oldAssetIdString}', attempted new assetId '{newAssetIdString}'");
-                    return;
-                }
-
-                // old is empty
-                m_AssetId = newAssetIdString;
-                // Debug.Log($"Settings AssetId on NetworkIdentity '{name}', new assetId '{newAssetIdString}'");
-            }
-        }
-        [SerializeField, HideInInspector] string m_AssetId;
 
         // Keep track of all sceneIds to detect scene duplicates
         static readonly Dictionary<ulong, NetworkIdentity> sceneIds =
@@ -311,15 +312,30 @@ namespace Mirror
             // Get all NetworkBehaviours
             // (never null. GetComponents returns [] if none found)
             NetworkBehaviours = GetComponents<NetworkBehaviour>();
-            if (NetworkBehaviours.Length > byte.MaxValue)
-                Debug.LogError($"Only {byte.MaxValue} NetworkBehaviour components are allowed for NetworkIdentity: {name} because we send the index as byte.", this);
+            ValidateComponents();
 
+            // ensure max components
             // initialize each one
             for (int i = 0; i < NetworkBehaviours.Length; ++i)
             {
                 NetworkBehaviour component = NetworkBehaviours[i];
                 component.netIdentity = this;
-                component.ComponentIndex = i;
+                component.ComponentIndex = (byte)i;
+            }
+        }
+
+        void ValidateComponents()
+        {
+            if (NetworkBehaviours == null)
+            {
+                Debug.LogError($"NetworkBehaviours array is null on {gameObject.name}!\n" +
+                    $"Typically this can happen when a networked object is a child of a " +
+                    $"non-networked parent that's disabled, preventing Awake on the networked object " +
+                    $"from being invoked, where the NetworkBehaviours array is initialized.", gameObject);
+            }
+            else if (NetworkBehaviours.Length > MaxNetworkBehaviours)
+            {
+                Debug.LogError($"NetworkIdentity {name} has too many NetworkBehaviour components: only {MaxNetworkBehaviours} NetworkBehaviour components are allowed in order to save bandwidth.", this);
             }
         }
 
@@ -358,7 +374,10 @@ namespace Mirror
         {
             // only set if not empty. fixes https://github.com/vis2k/Mirror/issues/2765
             if (!string.IsNullOrWhiteSpace(path))
-                m_AssetId = AssetDatabase.AssetPathToGUID(path);
+            {
+                Guid guid = new Guid(AssetDatabase.AssetPathToGUID(path));
+                assetId = (uint)guid.GetHashCode(); // deterministic
+            }
         }
 
         void AssignAssetID(GameObject prefab) => AssignAssetID(AssetDatabase.GetAssetPath(prefab));
@@ -557,7 +576,7 @@ namespace Mirror
                 //    anymore because assetId was cleared
                 if (!EditorApplication.isPlaying)
                 {
-                    m_AssetId = "";
+                    _assetId = 0;
                 }
                 // don't log. would show a lot when pressing play in uMMORPG/uSurvival/etc.
                 //else Debug.Log($"Avoided clearing assetId at runtime for {name} after (probably) clicking any of the NetworkIdentity properties.");
@@ -818,11 +837,11 @@ namespace Mirror
         bool hadAuthority;
         internal void NotifyAuthority()
         {
-            if (!hadAuthority && hasAuthority)
+            if (!hadAuthority && isOwned)
                 OnStartAuthority();
-            if (hadAuthority && !hasAuthority)
+            if (hadAuthority && !isOwned)
                 OnStopAuthority();
-            hadAuthority = hasAuthority;
+            hadAuthority = isOwned;
         }
 
         internal void OnStartAuthority()
@@ -865,100 +884,255 @@ namespace Mirror
             }
         }
 
-        // vis2k: readstring bug prevention: https://github.com/vis2k/Mirror/issues/2617
-        // -> OnSerialize writes length,componentData,length,componentData,...
-        // -> OnDeserialize carefully extracts each data, then deserializes each component with separate readers
-        //    -> it will be impossible to read too many or too few bytes in OnDeserialize
-        //    -> we can properly track down errors
-        bool OnSerializeSafely(NetworkBehaviour comp, NetworkWriter writer, bool initialState)
+        // build dirty mask for server owner & observers (= all dirty components).
+        // faster to do it in one iteration instead of iterating separately.
+        (ulong, ulong) ServerDirtyMasks(bool initialState)
         {
-            // write placeholder length bytes
-            // (jumping back later is WAY faster than allocating a temporary
-            //  writer for the payload, then writing payload.size, payload)
-            int headerPosition = writer.Position;
-            // no varint because we don't know the final size yet
-            writer.WriteInt(0);
-            int contentPosition = writer.Position;
+            ulong ownerMask    = 0;
+            ulong observerMask = 0;
 
-            // write payload
-            bool result = false;
-            try
+            NetworkBehaviour[] components = NetworkBehaviours;
+            for (int i = 0; i < components.Length; ++i)
             {
-                result = comp.OnSerialize(writer, initialState);
+                NetworkBehaviour component = components[i];
+
+                bool dirty = component.IsDirty();
+                ulong nthBit = (1u << i);
+
+                // owner needs to be considered for both SyncModes, because
+                // Observers mode always includes the Owner.
+                //
+                // for initial, it should always sync owner.
+                // for delta, only for ServerToClient and only if dirty.
+                //     ClientToServer comes from the owner client.
+                if (initialState || (component.syncDirection == SyncDirection.ServerToClient && dirty))
+                    ownerMask |= nthBit;
+
+                // observers need to be considered only in Observers mode
+                //
+                // for initial, it should always sync to observers.
+                // for delta, only if dirty.
+                // SyncDirection is irrelevant, as both are broadcast to
+                // observers which aren't the owner.
+                if (component.syncMode == SyncMode.Observers && (initialState || dirty))
+                    observerMask |= nthBit;
             }
-            catch (Exception e)
-            {
-                // show a detailed error and let the user know what went wrong
-                Debug.LogError($"OnSerialize failed for: object={name} component={comp.GetType()} sceneId={sceneId:X}\n\n{e}");
-            }
-            int endPosition = writer.Position;
 
-            // fill in length now
-            writer.Position = headerPosition;
-            writer.WriteInt(endPosition - contentPosition);
-            writer.Position = endPosition;
-
-            //Debug.Log($"OnSerializeSafely written for object {comp.name} component:{comp.GetType()} sceneId:{sceneId:X} header:{headerPosition} content:{contentPosition} end:{endPosition} contentSize:{endPosition - contentPosition}");
-
-            return result;
+            return (ownerMask, observerMask);
         }
 
-        // serialize all components using dirtyComponentsMask
+        // build dirty mask for client.
+        // server always knows initialState, so we don't need it here.
+        ulong ClientDirtyMask()
+        {
+            ulong mask = 0;
+
+            NetworkBehaviour[] components = NetworkBehaviours;
+            for (int i = 0; i < components.Length; ++i)
+            {
+                // on the client, we need to consider different sync scenarios:
+                //
+                //   ServerToClient SyncDirection:
+                //     do nothing.
+                //   ClientToServer SyncDirection:
+                //     serialize only if owned.
+
+                // on client, only consider owned components with SyncDirection to server
+                NetworkBehaviour component = components[i];
+                if (isOwned && component.syncDirection == SyncDirection.ClientToServer)
+                {
+                    // set the n-th bit if dirty
+                    // shifting from small to large numbers is varint-efficient.
+                    if (component.IsDirty()) mask |= (1u << i);
+                }
+            }
+
+            return mask;
+        }
+
+        // check if n-th component is dirty.
+        // in other words, if it has the n-th bit set in the dirty mask.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool IsDirty(ulong mask, int index)
+        {
+            ulong nthBit = (ulong)(1 << index);
+            return (mask & nthBit) != 0;
+        }
+
+        // serialize components into writer on the server.
         // check ownerWritten/observersWritten to know if anything was written
         // We pass dirtyComponentsMask into this function so that we can check
         // if any Components are dirty before creating writers
-        internal void OnSerializeAllSafely(bool initialState, NetworkWriter ownerWriter, NetworkWriter observersWriter)
+        internal void SerializeServer(bool initialState, NetworkWriter ownerWriter, NetworkWriter observersWriter)
         {
-            // check if components are in byte.MaxRange just to be 100% sure
-            // that we avoid overflows
+            // ensure NetworkBehaviours are valid before usage
+            ValidateComponents();
             NetworkBehaviour[] components = NetworkBehaviours;
-            if (components.Length > byte.MaxValue)
-                throw new IndexOutOfRangeException($"{name} has more than {byte.MaxValue} components. This is not supported.");
+
+            // check which components are dirty for owner / observers.
+            // this is quite complicated with SyncMode + SyncDirection.
+            // see the function for explanation.
+            //
+            // instead of writing a 1 byte index per component,
+            // we limit components to 64 bits and write one ulong instead.
+            // the ulong is also varint compressed for minimum bandwidth.
+            (ulong ownerMask, ulong observerMask) = ServerDirtyMasks(initialState);
+
+            // if nothing dirty, then don't even write the mask.
+            // otherwise, every unchanged object would send a 1 byte dirty mask!
+            if (ownerMask    != 0) Compression.CompressVarUInt(ownerWriter,     ownerMask);
+            if (observerMask != 0) Compression.CompressVarUInt(observersWriter, observerMask);
 
             // serialize all components
-            for (int i = 0; i < components.Length; ++i)
+            // perf: only iterate if either dirty mask has dirty bits.
+            if ((ownerMask | observerMask) != 0)
             {
-                // is this component dirty?
-                // -> always serialize if initialState so all components are included in spawn packet
-                // -> note: IsDirty() is false if the component isn't dirty or sendInterval isn't elapsed yet
-                NetworkBehaviour comp = components[i];
-                if (initialState || comp.IsDirty())
+                for (int i = 0; i < components.Length; ++i)
                 {
-                    //Debug.Log($"OnSerializeAllSafely: {name} -> {comp.GetType()} initial:{ initialState}");
+                    NetworkBehaviour comp = components[i];
 
-                    // remember start position in case we need to copy it into
-                    // observers writer too
-                    int startPosition = ownerWriter.Position;
-
-                    // write index as byte [0..255]
-                    ownerWriter.WriteByte((byte)i);
-
-                    // serialize into ownerWriter first
-                    // (owner always gets everything!)
-                    OnSerializeSafely(comp, ownerWriter, initialState);
-
-                    // copy into observersWriter too if SyncMode.Observers
-                    // -> we copy instead of calling OnSerialize again because
-                    //    we don't know what magic the user does in OnSerialize.
-                    // -> it's not guaranteed that calling it twice gets the
-                    //    same result
-                    // -> it's not guaranteed that calling it twice doesn't mess
-                    //    with the user's OnSerialize timing code etc.
-                    // => so we just copy the result without touching
-                    //    OnSerialize again
-                    if (comp.syncMode == SyncMode.Observers)
+                    // is the component dirty for anyone (owner or observers)?
+                    // may be serialized to owner, observer, both, or neither.
+                    //
+                    // OnSerialize should only be called once.
+                    // this is faster, and it cleaner because it may set
+                    // internal state, counters, logs, etc.
+                    //
+                    // previously we always serialized to owner and then copied
+                    // the serialization to observers. however, since
+                    // SyncDirection it's not guaranteed to be in owner anymore.
+                    // so we need to serialize to temporary writer first.
+                    // and then copy as needed.
+                    bool ownerDirty     = IsDirty(ownerMask, i);
+                    bool observersDirty = IsDirty(observerMask, i);
+                    if (ownerDirty || observersDirty)
                     {
-                        ArraySegment<byte> segment = ownerWriter.ToArraySegment();
-                        int length = ownerWriter.Position - startPosition;
-                        observersWriter.WriteBytes(segment.Array, startPosition, length);
+                        // serialize into helper writer
+                        using (NetworkWriterPooled temp = NetworkWriterPool.Get())
+                        {
+                            comp.Serialize(temp, initialState);
+                            ArraySegment<byte> segment = temp.ToArraySegment();
+
+                            // copy to owner / observers as needed
+                            if (ownerDirty)         ownerWriter.WriteBytes(segment.Array, segment.Offset, segment.Count);
+                            if (observersDirty) observersWriter.WriteBytes(segment.Array, segment.Offset, segment.Count);
+                        }
                     }
                 }
             }
         }
 
-        // get cached serialization for this tick (or serialize if none yet)
-        // IMPORTANT: int tick avoids floating point inaccuracy over days/weeks
-        internal NetworkIdentitySerialization GetSerializationAtTick(int tick)
+        // serialize components into writer on the client.
+        internal void SerializeClient(NetworkWriter writer)
+        {
+            // ensure NetworkBehaviours are valid before usage
+            ValidateComponents();
+            NetworkBehaviour[] components = NetworkBehaviours;
+
+            // check which components are dirty.
+            // this is quite complicated with SyncMode + SyncDirection.
+            // see the function for explanation.
+            //
+            // instead of writing a 1 byte index per component,
+            // we limit components to 64 bits and write one ulong instead.
+            // the ulong is also varint compressed for minimum bandwidth.
+            ulong dirtyMask = ClientDirtyMask();
+
+            // varint compresses the mask to 1 byte in most cases.
+            // instead of writing an 8 byte ulong.
+            //   7 components fit into 1 byte.  (previously  7 bytes)
+            //  11 components fit into 2 bytes. (previously 11 bytes)
+            //  16 components fit into 3 bytes. (previously 16 bytes)
+            // TODO imer: server knows amount of comps, write N bytes instead
+
+            // if nothing dirty, then don't even write the mask.
+            // otherwise, every unchanged object would send a 1 byte dirty mask!
+            if (dirtyMask != 0) Compression.CompressVarUInt(writer, dirtyMask);
+
+            // serialize all components
+            // perf: only iterate if dirty mask has dirty bits.
+            if (dirtyMask != 0)
+            {
+                // serialize all components
+                for (int i = 0; i < components.Length; ++i)
+                {
+                    NetworkBehaviour comp = components[i];
+
+                    // is this component dirty?
+                    // reuse the mask instead of calling comp.IsDirty() again here.
+                    if (IsDirty(dirtyMask, i))
+                    // if (isOwned && component.syncDirection == SyncDirection.ClientToServer)
+                    {
+                        // serialize into writer.
+                        // server always knows initialState, we never need to send it
+                        comp.Serialize(writer, false);
+                    }
+                }
+            }
+        }
+
+        // deserialize components from the client on the server.
+        // there's no 'initialState'. server always knows the initial state.
+        internal bool DeserializeServer(NetworkReader reader)
+        {
+            // ensure NetworkBehaviours are valid before usage
+            ValidateComponents();
+            NetworkBehaviour[] components = NetworkBehaviours;
+
+            // first we deserialize the varinted dirty mask
+            ulong mask = Compression.DecompressVarUInt(reader);
+
+            // now deserialize every dirty component
+            for (int i = 0; i < components.Length; ++i)
+            {
+                // was this one dirty?
+                if (IsDirty(mask, i))
+                {
+                    NetworkBehaviour comp = components[i];
+
+                    // safety check to ensure clients can only modify their own
+                    // ClientToServer components, nothing else.
+                    if (comp.syncDirection == SyncDirection.ClientToServer)
+                    {
+                        // deserialize this component
+                        // server always knows the initial state (initial=false)
+                        // disconnect if failed, to prevent exploits etc.
+                        if (!comp.Deserialize(reader, false)) return false;
+                    }
+                }
+            }
+
+            // successfully deserialized everything
+            return true;
+        }
+
+        // deserialize components from server on the client.
+        internal void DeserializeClient(NetworkReader reader, bool initialState)
+        {
+            // ensure NetworkBehaviours are valid before usage
+            ValidateComponents();
+            NetworkBehaviour[] components = NetworkBehaviours;
+
+            // first we deserialize the varinted dirty mask
+            ulong mask = Compression.DecompressVarUInt(reader);
+
+            // now deserialize every dirty component
+            for (int i = 0; i < components.Length; ++i)
+            {
+                // was this one dirty?
+                if (IsDirty(mask, i))
+                {
+                    // deserialize this component
+                    NetworkBehaviour comp = components[i];
+                    comp.Deserialize(reader, initialState);
+                }
+            }
+        }
+
+        // get cached serialization for this tick (or serialize if none yet).
+        // IMPORTANT: int tick avoids floating point inaccuracy over days/weeks.
+        // calls SerializeServer, so this function is to be called on server.
+        internal NetworkIdentitySerialization GetServerSerializationAtTick(int tick)
         {
             // only rebuild serialization once per tick. reuse otherwise.
             // except for tests, where Time.frameCount never increases.
@@ -966,16 +1140,20 @@ namespace Mirror
             // (otherwise [SyncVar] changes would never be serialized in tests)
             //
             // NOTE: != instead of < because int.max+1 overflows at some point.
-            if (lastSerialization.tick != tick || !Application.isPlaying)
+            if (lastSerialization.tick != tick
+#if UNITY_EDITOR
+                || !Application.isPlaying
+#endif
+               )
             {
                 // reset
                 lastSerialization.ownerWriter.Position = 0;
                 lastSerialization.observersWriter.Position = 0;
 
                 // serialize
-                OnSerializeAllSafely(false,
-                                     lastSerialization.ownerWriter,
-                                     lastSerialization.observersWriter);
+                SerializeServer(false,
+                                lastSerialization.ownerWriter,
+                                lastSerialization.observersWriter);
 
                 // clear dirty bits for the components that we serialized.
                 // previously we did this in NetworkServer.BroadcastToConnection
@@ -984,7 +1162,7 @@ namespace Mirror
                 // 'lastSerialization.tick != tick' scope.
                 // so only do it once.
                 //
-                // NOTE: not in OnSerializeAllSafely as that should only do one
+                // NOTE: not in Serializell as that should only do one
                 //       thing: serialize data.
                 //
                 //
@@ -1007,71 +1185,8 @@ namespace Mirror
             return lastSerialization;
         }
 
-        void OnDeserializeSafely(NetworkBehaviour comp, NetworkReader reader, bool initialState)
-        {
-            // read header as 4 bytes and calculate this chunk's start+end
-            int contentSize = reader.ReadInt();
-            int chunkStart = reader.Position;
-            int chunkEnd = reader.Position + contentSize;
-
-            // call OnDeserialize and wrap it in a try-catch block so there's no
-            // way to mess up another component's deserialization
-            try
-            {
-                //Debug.Log($"OnDeserializeSafely: {comp.name} component:{comp.GetType()} sceneId:{sceneId:X} length:{contentSize}");
-                comp.OnDeserialize(reader, initialState);
-            }
-            catch (Exception e)
-            {
-                // show a detailed error and let the user know what went wrong
-                Debug.LogError($"OnDeserialize failed Exception={e.GetType()} (see below) object={name} component={comp.GetType()} sceneId={sceneId:X} length={contentSize}. Possible Reasons:\n" +
-                               $"  * Do {comp.GetType()}'s OnSerialize and OnDeserialize calls write the same amount of data({contentSize} bytes)? \n" +
-                               $"  * Was there an exception in {comp.GetType()}'s OnSerialize/OnDeserialize code?\n" +
-                               $"  * Are the server and client the exact same project?\n" +
-                               $"  * Maybe this OnDeserialize call was meant for another GameObject? The sceneIds can easily get out of sync if the Hierarchy was modified only in the client OR the server. Try rebuilding both.\n\n" +
-                               $"Exception {e}");
-            }
-
-            // now the reader should be EXACTLY at 'before + size'.
-            // otherwise the component read too much / too less data.
-            if (reader.Position != chunkEnd)
-            {
-                // warn the user
-                int bytesRead = reader.Position - chunkStart;
-                Debug.LogWarning($"OnDeserialize was expected to read {contentSize} instead of {bytesRead} bytes for object:{name} component={comp.GetType()} sceneId={sceneId:X}. Make sure that OnSerialize and OnDeserialize write/read the same amount of data in all cases.");
-
-                // fix the position, so the following components don't all fail
-                reader.Position = chunkEnd;
-            }
-        }
-
-        internal void OnDeserializeAllSafely(NetworkReader reader, bool initialState)
-        {
-            if (NetworkBehaviours == null)
-            {
-                Debug.LogError($"NetworkBehaviours array is null on {gameObject.name}!\n" +
-                    $"Typically this can happen when a networked object is a child of a " +
-                    $"non-networked parent that's disabled, preventing Awake on the networked object " +
-                    $"from being invoked, where the NetworkBehaviours array is initialized.", gameObject);
-                return;
-            }
-
-            // deserialize all components that were received
-            NetworkBehaviour[] components = NetworkBehaviours;
-            while (reader.Remaining > 0)
-            {
-                // read & check index [0..255]
-                byte index = reader.ReadByte();
-                if (index < components.Length)
-                {
-                    // deserialize this component
-                    OnDeserializeSafely(components[index], reader, initialState);
-                }
-            }
-        }
-
         // Helper function to handle Command/Rpc
-        internal void HandleRemoteCall(byte componentIndex, int functionHash, RemoteCallType remoteCallType, NetworkReader reader, NetworkConnectionToClient senderConnection = null)
+        internal void HandleRemoteCall(byte componentIndex, ushort functionHash, RemoteCallType remoteCallType, NetworkReader reader, NetworkConnectionToClient senderConnection = null)
         {
             // check if unity object has been destroyed
             if (this == null)
@@ -1249,7 +1364,7 @@ namespace Mirror
             //isLocalPlayer = false; <- cleared AFTER ClearLocalPlayer below!
 
             // remove authority flag. This object may be unspawned, not destroyed, on client.
-            hasAuthority = false;
+            isOwned = false;
             NotifyAuthority();
 
             netId = 0;

@@ -3,6 +3,14 @@ using UnityEngine;
 
 namespace Mirror
 {
+    // need to send time every sendInterval.
+    // batching automatically includes remoteTimestamp.
+    // all we need to do is ensure that an empty message is sent.
+    // and react to it.
+    // => we don't want to insert a snapshot on every batch.
+    // => do it exactly every sendInterval on every TimeSnapshotMessage.
+    public struct TimeSnapshotMessage : NetworkMessage {}
+
     public struct ReadyMessage : NetworkMessage {}
 
     public struct NotReadyMessage : NetworkMessage {}
@@ -28,7 +36,7 @@ namespace Mirror
     {
         public uint netId;
         public byte componentIndex;
-        public int functionHash;
+        public ushort functionHash;
         // the parameters for the Cmd function
         // -> ArraySegment to avoid unnecessary allocations
         public ArraySegment<byte> payload;
@@ -38,7 +46,7 @@ namespace Mirror
     {
         public uint netId;
         public byte componentIndex;
-        public int functionHash;
+        public ushort functionHash;
         // the parameters for the Cmd function
         // -> ArraySegment to avoid unnecessary allocations
         public ArraySegment<byte> payload;
@@ -53,7 +61,7 @@ namespace Mirror
         public bool isOwner;
         public ulong sceneId;
         // If sceneId != 0 then it is used instead of assetId
-        public Guid assetId;
+        public uint assetId;
         // Local position
         public Vector3 position;
         // Local rotation

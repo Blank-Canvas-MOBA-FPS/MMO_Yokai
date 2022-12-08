@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using kcp2k;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using UnityEngine.Serialization;
@@ -29,13 +28,34 @@ namespace Mirror
         public bool runInBackground = true;
 
         /// <summary>Should the server auto-start when 'Server Build' is checked in build settings</summary>
+        [Header("Headless Builds")]
         [Tooltip("Should the server auto-start when 'Server Build' is checked in build settings")]
         [FormerlySerializedAs("startOnHeadless")]
         public bool autoStartServerBuild = true;
 
+        [Tooltip("Automatically connect the client in headless builds. Useful for CCU tests with bot clients.\n\nAddress may be passed as command line argument.\n\nMake sure that only 'autostartServer' or 'autoconnectClient' is enabled, not both!")]
+        public bool autoConnectClientBuild;
+
         /// <summary>Server Update frequency, per second. Use around 60Hz for fast paced games like Counter-Strike to minimize latency. Use around 30Hz for games like WoW to minimize computations. Use around 1-10Hz for slow paced games like EVE.</summary>
-        [Tooltip("Server Update frequency, per second. Use around 60Hz for fast paced games like Counter-Strike to minimize latency. Use around 30Hz for games like WoW to minimize computations. Use around 1-10Hz for slow paced games like EVE.")]
-        public int serverTickRate = 30;
+        [Tooltip("Server & Client send rate per second. Use around 60Hz for fast paced games like Counter-Strike to minimize latency. Use around 30Hz for games like WoW to minimize computations. Use around 1-10Hz for slow paced games like EVE.")]
+        [FormerlySerializedAs("serverTickRate")]
+        public int sendRate = 30;
+        [Obsolete("NetworkManager.serverTickRate was renamed to sendRate because that's what it configures for both server & client now.")]
+        public int serverTickRate => sendRate;
+
+        // tick rate is in Hz.
+        // convert to interval in seconds for convenience where needed.
+        //
+        // send interval is 1 / sendRate.
+        // but for tests we need a way to set it to exactly 0.
+        // 1 / int.max would not be exactly 0, so handel that manually.
+        [Obsolete("NetworkManager.serverTickInterval was moved to NetworkServer.tickInterval for consistency.")]
+        public float serverTickInterval => NetworkServer.tickInterval;
+
+        // client send rate follows server send rate to avoid errors for now
+        /// <summary>Client Update frequency, per second. Use around 60Hz for fast paced games like Counter-Strike to minimize latency. Use around 30Hz for games like WoW to minimize computations. Use around 1-10Hz for slow paced games like EVE.</summary>
+        // [Tooltip("Client broadcasts 'sendRate' times per second. Use around 60Hz for fast paced games like Counter-Strike to minimize latency. Use around 30Hz for games like WoW to minimize computations. Use around 1-10Hz for slow paced games like EVE.")]
+        // public int clientSendRate = 30; // 33 ms
 
         /// <summary>Automatically switch to this scene upon going offline (on start / on disconnect / on shutdown).</summary>
         [Header("Scene Management")]
@@ -53,8 +73,7 @@ namespace Mirror
         // transport layer
         [Header("Network Info")]
         [Tooltip("Transport component attached to this object that server and client will use to connect")]
-        [SerializeField]
-        protected Transport transport;
+        public Transport transport;
 
         /// <summary>Server's address for clients to connect to.</summary>
         [FormerlySerializedAs("m_NetworkAddress")]
@@ -95,6 +114,9 @@ namespace Mirror
         /// <summary>List of transforms populated by NetworkStartPositions</summary>
         public static List<Transform> startPositions = new List<Transform>();
         public static int startPositionIndex;
+
+        [Header("Debug")]
+        public bool timeInterpolationGui = false;
 
         /// <summary>The one and only NetworkManager</summary>
         public static NetworkManager singleton { get; internal set; }
@@ -161,24 +183,6 @@ namespace Mirror
                     return;
                 }
             }
-
-            // add transport if there is none yet. makes upgrading easier.
-            if (transport == null)
-            {
-#if UNITY_EDITOR
-                // RecordObject needs to be called before we make the change
-                UnityEditor.Undo.RecordObject(gameObject, "Added default Transport");
-#endif
-
-                transport = GetComponent<Transport>();
-
-                // was a transport added yet? if not, add one
-                if (transport == null)
-                {
-                    transport = gameObject.AddComponent<KcpTransport>();
-                    Debug.Log("NetworkManager: added default Transport because there was none yet.");
-                }
-            }
         }
 
         // virtual so that inheriting classes' Awake() can call base.Awake() too
@@ -188,6 +192,9 @@ namespace Mirror
             if (!InitializeSingleton()) return;
 
             Debug.Log("Mirror | mirror-networking.com | discord.gg/N9QVxbM");
+
+            // Apply configuration in Awake once already
+            ApplyConfiguration();
 
             // Set the networkSceneName to prevent a scene reload
             // if client connection to server fails.
@@ -210,7 +217,18 @@ namespace Mirror
             {
                 StartServer();
             }
+            // only start server or client, never both
+            else if(autoConnectClientBuild)
+            {
+                StartClient();
+            }
 #endif
+        }
+
+        // make sure to call base.Update() when overwriting
+        public virtual void Update()
+        {
+            ApplyConfiguration();
         }
 
         // virtual so that inheriting classes' LateUpdate() can call base.LateUpdate() too
@@ -230,6 +248,16 @@ namespace Mirror
         {
             Scene activeScene = SceneManager.GetActiveScene();
             return activeScene.path == scene || activeScene.name == scene;
+        }
+
+        // NetworkManager exposes some NetworkServer/Client configuration.
+        // we apply it every Update() in order to avoid two sources of truth.
+        // fixes issues where NetworkServer.sendRate was never set because
+        // NetworkManager.StartServer was never called, etc.
+        // => all exposed settings should be applied at all times if NM exists.
+        void ApplyConfiguration()
+        {
+            NetworkServer.tickRate = sendRate;
         }
 
         // full server setup code, without spawning objects yet
@@ -307,6 +335,22 @@ namespace Mirror
             }
         }
 
+        void SetupClient()
+        {
+            InitializeSingleton();
+
+            if (runInBackground)
+                Application.runInBackground = true;
+
+            if (authenticator != null)
+            {
+                authenticator.OnStartClient();
+                authenticator.OnClientAuthenticated.AddListener(OnClientAuthenticated);
+            }
+
+            // NetworkClient.sendRate = clientSendRate;
+        }
+
         /// <summary>Starts the client, connects it to the server with networkAddress.</summary>
         public void StartClient()
         {
@@ -318,16 +362,7 @@ namespace Mirror
 
             mode = NetworkManagerMode.ClientOnly;
 
-            InitializeSingleton();
-
-            if (runInBackground)
-                Application.runInBackground = true;
-
-            if (authenticator != null)
-            {
-                authenticator.OnStartClient();
-                authenticator.OnClientAuthenticated.AddListener(OnClientAuthenticated);
-            }
+            SetupClient();
 
             // In case this is a headless client...
             ConfigureHeadlessFrameRate();
@@ -357,16 +392,7 @@ namespace Mirror
 
             mode = NetworkManagerMode.ClientOnly;
 
-            InitializeSingleton();
-
-            if (runInBackground)
-                Application.runInBackground = true;
-
-            if (authenticator != null)
-            {
-                authenticator.OnStartClient();
-                authenticator.OnClientAuthenticated.AddListener(OnClientAuthenticated);
-            }
+            SetupClient();
 
             RegisterClientMessages();
 
@@ -489,11 +515,7 @@ namespace Mirror
         {
             //Debug.Log("NetworkManager ConnectLocalClient");
 
-            if (authenticator != null)
-            {
-                authenticator.OnStartClient();
-                authenticator.OnClientAuthenticated.AddListener(OnClientAuthenticated);
-            }
+            SetupClient();
 
             networkAddress = "localhost";
             NetworkServer.ActivateHostScene();
@@ -642,7 +664,7 @@ namespace Mirror
         public virtual void ConfigureHeadlessFrameRate()
         {
 #if UNITY_SERVER
-            Application.targetFrameRate = serverTickRate;
+            Application.targetFrameRate = sendRate;
             // Debug.Log($"Server Tick Rate set to {Application.targetFrameRate} Hz.");
 #endif
         }
@@ -680,7 +702,7 @@ namespace Mirror
 
             // set active transport AFTER setting singleton.
             // so only if we didn't destroy ourselves.
-            Transport.activeTransport = transport;
+            Transport.active = transport;
             return true;
         }
 
@@ -781,7 +803,10 @@ namespace Mirror
             if (NetworkServer.active)
             {
                 // notify all clients about the new scene
-                NetworkServer.SendToAll(new SceneMessage { sceneName = newSceneName });
+                NetworkServer.SendToAll(new SceneMessage
+                {
+                    sceneName = newSceneName
+                });
             }
 
             startPositionIndex = 0;
@@ -955,10 +980,7 @@ namespace Mirror
 
             if (clientReadyConnection != null)
             {
-#pragma warning disable 618
-                // obsolete method calls new method because it's not empty
-                OnClientConnect(clientReadyConnection);
-#pragma warning restore 618
+                OnClientConnect();
                 clientLoadedScene = true;
                 clientReadyConnection = null;
             }
@@ -992,13 +1014,7 @@ namespace Mirror
                 OnServerSceneChanged(networkSceneName);
 
                 if (NetworkClient.isConnected)
-                {
-                    // let client know that we changed scene
-#pragma warning disable 618
-                    // obsolete method calls new method because it's not empty
-                    OnClientSceneChanged(NetworkClient.connection);
-#pragma warning restore 618
-                }
+                    OnClientSceneChanged();
             }
         }
 
@@ -1024,21 +1040,13 @@ namespace Mirror
 
             if (clientReadyConnection != null)
             {
-#pragma warning disable 618
-                // obsolete method calls new method because it's not empty
-                OnClientConnect(clientReadyConnection);
-#pragma warning restore 618
+                OnClientConnect();
                 clientLoadedScene = true;
                 clientReadyConnection = null;
             }
 
             if (NetworkClient.isConnected)
-            {
-#pragma warning disable 618
-                // obsolete method calls new method because it's not empty
-                OnClientSceneChanged(NetworkClient.connection);
-#pragma warning restore 618
-            }
+                OnClientSceneChanged();
         }
 
         /// <summary>
@@ -1070,7 +1078,7 @@ namespace Mirror
         }
 
         /// <summary>Get the next NetworkStartPosition based on the selected PlayerSpawnMethod.</summary>
-        public Transform GetStartPosition()
+        public virtual Transform GetStartPosition()
         {
             // first remove any dead transforms
             startPositions.RemoveAll(t => t == null);
@@ -1118,7 +1126,10 @@ namespace Mirror
             // proceed with the login handshake by calling OnServerConnect
             if (networkSceneName != "" && networkSceneName != offlineScene)
             {
-                SceneMessage msg = new SceneMessage() { sceneName = networkSceneName };
+                SceneMessage msg = new SceneMessage()
+                {
+                    sceneName = networkSceneName
+                };
                 conn.Send(msg);
             }
 
@@ -1184,10 +1195,7 @@ namespace Mirror
             if (string.IsNullOrWhiteSpace(onlineScene) || onlineScene == offlineScene || IsSceneActive(onlineScene))
             {
                 clientLoadedScene = false;
-#pragma warning disable 618
-                // obsolete method calls new method because it's not empty
-                OnClientConnect(NetworkClient.connection);
-#pragma warning restore 618
+                OnClientConnect();
             }
             else
             {
@@ -1200,19 +1208,13 @@ namespace Mirror
         void OnClientDisconnectInternal()
         {
             //Debug.Log("NetworkManager.OnClientDisconnectInternal");
-#pragma warning disable 618
-            // obsolete method calls new method because it's not empty
-            OnClientDisconnect(NetworkClient.connection);
-#pragma warning restore 618
+            OnClientDisconnect();
         }
 
         void OnClientNotReadyMessageInternal(NotReadyMessage msg)
         {
             //Debug.Log("NetworkManager.OnClientNotReadyMessageInternal");
             NetworkClient.ready = false;
-#pragma warning disable 618
-            OnClientNotReady(NetworkClient.connection);
-#pragma warning restore 618
             OnClientNotReady();
 
             // NOTE: clientReadyConnection is not set here! don't want OnClientConnect to be invoked again after scene changes.
@@ -1269,8 +1271,16 @@ namespace Mirror
             NetworkServer.AddPlayerForConnection(conn, player);
         }
 
-        /// <summary>Called on server when transport raises an exception. NetworkConnection may be null.</summary>
+        // DEPRECATED 2022-05-12
+        [Obsolete("OnServerError(conn, Exception) was changed to OnServerError(conn, TransportError, string)")]
         public virtual void OnServerError(NetworkConnectionToClient conn, Exception exception) {}
+        /// <summary>Called on server when transport raises an exception. NetworkConnection may be null.</summary>
+        public virtual void OnServerError(NetworkConnectionToClient conn, TransportError error, string reason)
+        {
+#pragma warning disable CS0618
+            OnServerError(conn, new Exception(reason));
+#pragma warning restore CS0618
+        }
 
         /// <summary>Called from ServerChangeScene immediately before SceneManager.LoadSceneAsync is executed</summary>
         public virtual void OnServerChangeScene(string newSceneName) {}
@@ -1296,10 +1306,6 @@ namespace Mirror
             }
         }
 
-        // Deprecated 2021-12-11
-        [Obsolete("Remove the NetworkConnection parameter in your override and use NetworkClient.connection instead.")]
-        public virtual void OnClientConnect(NetworkConnection conn) => OnClientConnect();
-
         /// <summary>Called on clients when disconnected from a server.</summary>
         public virtual void OnClientDisconnect()
         {
@@ -1309,19 +1315,19 @@ namespace Mirror
             StopClient();
         }
 
-        // Deprecated 2021-12-11
-        [Obsolete("Remove the NetworkConnection parameter in your override and use NetworkClient.connection instead.")]
-        public virtual void OnClientDisconnect(NetworkConnection conn) => OnClientDisconnect();
-
-        /// <summary>Called on client when transport raises an exception.</summary>
+        // DEPRECATED 2022-05-12
+        [Obsolete("OnClientError(Exception) was changed to OnClientError(TransportError, string)")]
         public virtual void OnClientError(Exception exception) {}
+        /// <summary>Called on client when transport raises an exception.</summary>
+        public virtual void OnClientError(TransportError error, string reason)
+        {
+#pragma warning disable CS0618
+            OnClientError(new Exception(reason));
+#pragma warning restore CS0618
+        }
 
         /// <summary>Called on clients when a servers tells the client it is no longer ready, e.g. when switching scenes.</summary>
         public virtual void OnClientNotReady() {}
-
-        // Deprecated 2021-12-11
-        [Obsolete("Remove the NetworkConnection parameter in your override and use NetworkClient.connection instead.")]
-        public virtual void OnClientNotReady(NetworkConnection conn) {}
 
         /// <summary>Called from ClientChangeScene immediately before SceneManager.LoadSceneAsync is executed</summary>
         // customHandling: indicates if scene loading will be handled through overrides
@@ -1343,10 +1349,6 @@ namespace Mirror
                 NetworkClient.AddPlayer();
             }
         }
-
-        // Deprecated 2021-12-11
-        [Obsolete("Remove the NetworkConnection parameter in your override and use NetworkClient.connection instead.")]
-        public virtual void OnClientSceneChanged(NetworkConnection conn) => OnClientSceneChanged();
 
         // Since there are multiple versions of StartServer, StartClient and
         // StartHost, to reliably customize their functionality, users would
@@ -1370,5 +1372,12 @@ namespace Mirror
 
         /// <summary>This is called when a host is stopped.</summary>
         public virtual void OnStopHost() {}
+
+        // keep OnGUI even in builds. useful to debug snap interp.
+        void OnGUI()
+        {
+            if (!timeInterpolationGui) return;
+            NetworkClient.OnGUI();
+        }
     }
 }

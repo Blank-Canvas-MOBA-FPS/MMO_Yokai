@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Text;
 using Unity.Collections.LowLevel.Unsafe;
 using UnityEngine;
 
@@ -9,14 +10,28 @@ namespace Mirror
     public class NetworkWriter
     {
         public const int MaxStringLength = 1024 * 32;
+        public const int DefaultCapacity = 1500;
 
         // create writer immediately with it's own buffer so no one can mess with it and so that we can resize it.
         // note: BinaryWriter allocates too much, so we only use a MemoryStream
         // => 1500 bytes by default because on average, most packets will be <= MTU
-        byte[] buffer = new byte[1500];
+        internal byte[] buffer = new byte[DefaultCapacity];
 
         /// <summary>Next position to write to the buffer</summary>
         public int Position;
+
+        /// <summary>Current capacity. Automatically resized if necessary.</summary>
+        public int Capacity => buffer.Length;
+
+        // cache encoding for WriteString instead of creating it each time.
+        // 1000 readers before:  1MB GC, 30ms
+        // 1000 readers after: 0.8MB GC, 18ms
+        // not(!) static for thread safety.
+        //
+        // throwOnInvalidBytes is true.
+        // writer should throw and user should fix if this ever happens.
+        // unlike reader, which needs to expect it to happen from attackers.
+        internal readonly UTF8Encoding encoding = new UTF8Encoding(false, true);
 
         /// <summary>Reset both the position and length of the stream</summary>
         // Leaves the capacity the same so that we can reuse this writer without
@@ -31,7 +46,7 @@ namespace Mirror
         // 1. 'has space' checks are necessary even for fixed sized writers.
         // 2. all writers will eventually be large enough to stop resizing.
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        void EnsureCapacity(int value)
+        internal void EnsureCapacity(int value)
         {
             if (buffer.Length < value)
             {
@@ -41,6 +56,7 @@ namespace Mirror
         }
 
         /// <summary>Copies buffer until 'Position' to a new array.</summary>
+        // Try to use ToArraySegment instead to avoid allocations!
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public byte[] ToArray()
         {
@@ -51,10 +67,13 @@ namespace Mirror
 
         /// <summary>Returns allocation-free ArraySegment until 'Position'.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public ArraySegment<byte> ToArraySegment()
-        {
-            return new ArraySegment<byte>(buffer, 0, Position);
-        }
+        public ArraySegment<byte> ToArraySegment() =>
+            new ArraySegment<byte>(buffer, 0, Position);
+
+        // implicit conversion for convenience
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static implicit operator ArraySegment<byte>(NetworkWriter w) =>
+            w.ToArraySegment();
 
         // WriteBlittable<T> from DOTSNET.
         // this is extremely fast, but only works for blittable types.
@@ -82,6 +101,26 @@ namespace Mirror
         //   WriteBlittable assumes same endianness for server & client.
         //   All Unity 2018+ platforms are little endian.
         //   => run NetworkWriterTests.BlittableOnThisPlatform() to verify!
+        //
+        // This is not safe to expose to random structs.
+        //   * StructLayout.Sequential is the default, which is safe.
+        //     if the struct contains a reference type, it is converted to Auto.
+        //     but since all structs here are unmanaged blittable, it's safe.
+        //     see also: https://docs.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.layoutkind?view=netframework-4.8#system-runtime-interopservices-layoutkind-sequential
+        //   * StructLayout.Pack depends on CPU word size.
+        //     this may be different 4 or 8 on some ARM systems, etc.
+        //     this is not safe, and would cause bytes/shorts etc. to be padded.
+        //     see also: https://docs.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.structlayoutattribute.pack?view=net-6.0
+        //   * If we force pack all to '1', they would have no padding which is
+        //     great for bandwidth. but on some android systems, CPU can't read
+        //     unaligned memory.
+        //     see also: https://github.com/vis2k/Mirror/issues/3044
+        //   * The only option would be to force explicit layout with multiples
+        //     of word size. but this requires lots of weaver checking and is
+        //     still questionable (IL2CPP etc.).
+        //
+        // Note: inlining WriteBlittable is enough. don't inline WriteInt etc.
+        //       we don't want WriteBlittable to be copied in place everywhere.
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal unsafe void WriteBlittable<T>(T value)
             where T : unmanaged
@@ -148,17 +187,35 @@ namespace Mirror
                 WriteBlittable(value.Value);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void WriteByte(byte value) => WriteBlittable(value);
 
         // for byte arrays with consistent size, where the reader knows how many to read
         // (like a packet opcode that's always the same)
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void WriteBytes(byte[] buffer, int offset, int count)
+        public void WriteBytes(byte[] array, int offset, int count)
         {
             EnsureCapacity(Position + count);
-            Array.ConstrainedCopy(buffer, offset, this.buffer, Position, count);
+            Array.ConstrainedCopy(array, offset, this.buffer, Position, count);
             Position += count;
+        }
+        // write an unsafe byte* array.
+        // useful for bit tree compression, etc.
+        public unsafe bool WriteBytes(byte* ptr, int offset, int size)
+        {
+            EnsureCapacity(Position + size);
+
+            fixed (byte* destination = &buffer[Position])
+            {
+                // write 'size' bytes at position
+                // 10 mio writes: 868ms
+                //   Array.Copy(value.Array, value.Offset, buffer, Position, value.Count);
+                // 10 mio writes: 775ms
+                //   Buffer.BlockCopy(value.Array, value.Offset, buffer, Position, value.Count);
+                // 10 mio writes: 637ms
+                UnsafeUtility.MemCpy(destination, ptr + offset, size);
+            }
+
+            Position += size;
+            return true;
         }
 
         /// <summary>Writes any type that mirror supports. Uses weaver populated Writer(T).write.</summary>
@@ -175,6 +232,12 @@ namespace Mirror
                 writeDelegate(this, value);
             }
         }
+
+        // print with buffer content for easier debugging.
+        // [content, position / capacity].
+        // showing "position / space" would be too confusing.
+        public override string ToString() =>
+            $"[{ToArraySegment().ToHexString()} @ {Position}/{Capacity}]";
     }
 
     /// <summary>Helper class that weaver populates with all writer types.</summary>
